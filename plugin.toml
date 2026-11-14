@@ -10,7 +10,7 @@
 [plugin]
 id = "schoeller.example_panel"
 name = "Panel Example"
-version = "0.1.0"
+version = "0.3.0"
 description = "Reference dynamically-loaded add-on: a dockable side panel with live control events."
 author = "Sebastian Schoeller"
 license = "GPL-3.0-only"
@@ -19,7 +19,7 @@ repository = "schoeller/example_plugin_panel"
 [opencad]
 # Keep in sync with the Rust manifest's `ApiVersion::CURRENT` — this is the
 # pre-load gate; the runner also checks the compiled-in symbol.
-api_version = 21
+api_version = 22
 rustc_version = "__RUSTC_VERSION__"
 acadrust_source = "__ACADRUST_SOURCE__"
 ribbon_order = 110

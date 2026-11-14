@@ -6,7 +6,7 @@ surface counterpart of the ribbon-tab example (
 [HakanSeven12/opencad-example-plugin](https://github.com/HakanSeven12/opencad-example-plugin)).
 
 Builds a `cdylib` against [`ocs_plugin_api`](../OpenCADStudio/crates/ocs_plugin_api)
-(API v21) and exports the host symbols via `ocs_plugin_api::export_plugin!`.
+(API v22) and exports the host symbols via `ocs_plugin_api::export_plugin!`.
 
 ## What it demonstrates
 
@@ -18,6 +18,10 @@ Builds a `cdylib` against [`ocs_plugin_api`](../OpenCADStudio/crates/ocs_plugin_
 | Host-classified buttons | `action: Some("close")` on the **Hide** button — a built-in keyword the host handles itself. |
 | Click-only buttons | **Ping** has no `action`, so the host emits a `click` event; the plugin counts pings, reported on the next Apply. |
 | `HostApi::toggle_panel` | `EPL_OPEN` (panel `command`) / `EPL_PANEL` (panel id) from the command prompt, or the ribbon tool. |
+| `HostNotification::SelectionChangedDigest` (v22) | O(1) selection facts — `{tab_id, revision, count}`, revision monotonic per tab; the plugin skips stale revisions and refreshes the label through a 16 ms-gated `PluginRequest::UpdatePanel` on the thread-safe request line. |
+| `EPL_APPLY_SELECTION` / `EPL_REVERT_SELECTION` | One reversible journal per tab: apply journals originals and recolors via a single `UpdateEntitiesTransaction` undo group; revert restores only handles whose state still matches what apply wrote — external edits/deletes come back as counted conflicts, never clobbered — and reselects the restored set. |
+| `EPL_INSPECT` | Batch-reads the first 256 selected entities and reports the kind breakdown. |
+| Structured panel values (v22) | Checkbox/Choice/Color/Label drafts are typed in state reads (`bool`, `{index,text}`+`options`, `[r,g,b]`, label text) — automation reads real state, not debug strings. |
 
 ## Commands
 
@@ -26,6 +30,75 @@ Builds a `cdylib` against [`ocs_plugin_api`](../OpenCADStudio/crates/ocs_plugin_
 | `EPL_OPEN` | Toggle the panel. Same effect via the ribbon **Panels → Panel** tool. |
 | `EPL_PANEL` | Alias — the host also registers the panel id itself as a dynamic command. |
 | `EPL_APPLY` | Re-render the panel summary label from tracked values (wired to **Apply**). |
+| `EPL_APPLY_SELECTION` | Journal + recolor the selection (stroke draft → per-entity colour), one undo group. Wired to **Apply to Sel**. |
+| `EPL_REVERT_SELECTION` | Restore journaled originals where unchanged; conflicts reported. Wired to **Revert**. |
+| `EPL_INSPECT` | Report the selection's kind breakdown (first 256). Wired to **Inspect**. |
+
+## The verified roundtrip loop (agent ⇄ host ⇄ plugin, over MCP)
+
+This is the loop exercised live against a v22 release host — every step
+below is scriptable through the native MCP stdio bridge
+(`OpenCADStudio.exe --mcp`); with the panel visible, selection forming and
+drafts changing on screen happen **without touching the GUI**.
+
+| Direction | Channel | Payload |
+|-----------|---------|---------|
+| agent → host | `ocs_execute` / `ocs_read` | `new`, `run`, `select`, `panel_action`, `undo`, `redo`, `entities_set`, `batch`, `state` |
+| host → plugin | runner notification stream | `SelectionChangedDigest` (v22), `PanelAction` (typed click/change), document events |
+| plugin → host | thread-safe `plugin_request_sender()` | `UpdatePanel` (draft writes), `GetEntitiesBatch`, `UpdateEntitiesTransaction`, `set_selection` |
+
+Verified sequence (one drawing, handles `84`/`85`/`86`):
+
+```sh
+# 1. open: the panel id and command are dynamic completions
+ocs_execute {"op":"run","cmd":"EPL_OPEN"}            -> ok
+# 2. create entities in one batch (single-shot commands return completed)
+ocs_execute {"op":"batch","steps":[
+  {"op":"run","cmd":"LINE 0,0 10,0"},
+  {"op":"run","cmd":"LINE 10,0 10,5"},
+  {"op":"run","cmd":"CIRCLE 0,0 5"}]}
+# 3. select → the plugin's summary label tracks the digest
+ocs_read    {"op":"state"}        -> plugin_panels[epl_panel]
+#                          epl_label_summary ends with "… sel 3 rev 2"
+# 4. typed UI interaction without a window
+ocs_execute {"op":"panel_action","panel_id":"epl_panel",
+             "control_id":"epl_button_ping"}           -> the plugin's ping counter (+1)
+ocs_execute {"op":"panel_action","panel_id":"epl_panel",
+             "control_id":"epl_choice_style","action":"change",
+             "value":{"index":2}}                      -> Choice {index:2, text:"Survey"}
+ocs_execute {"op":"panel_action","panel_id":"epl_panel",
+             "control_id":"epl_number_length","action":"change","value":12}
+# 5. reversible write through the host engine
+ocs_execute {"op":"run","cmd":"EPL_APPLY_SELECTION"}   -> colours Rgb{46,125,50}, one undo group
+# 6. host-native undo/redo moves the colours back and forth;
+#    the plugin never re-applies (no clobbering, exact-state journal)
+ocs_execute {"op":"undo"} / {"op":"redo"}
+# 7. conflict: an external edit stays, the rest restores
+ocs_execute {"op":"entities_set","handles":["85"],"color":{"rgb":[10,10,10]}}
+ocs_execute {"op":"run","cmd":"EPL_REVERT_SELECTION"}  -> 85 keeps black (conflict), rest ByLayer
+```
+
+Rules an agent must keep:
+
+- `request_id` is **mandatory and unique for the whole session** — reusing
+  one with a changed payload is refused; the same payload replays its
+  original verdict (safe retries).
+- Multi-step interactive commands must ride **one `batch`** request: the
+  command line is owned by the requesting client until the flow ends; a
+  dead owner parks it until its deadline.
+- `panel_action` value shapes are RAW (the same shapes the op schema
+  advertises): `{"index": 2}` for choices (text optional — it defaults to
+  `options[index]`), plain booleans/numbers/strings for the other draft
+  kinds. Color is picker-only (drafts reach the plugin via the picker or
+  a plugin's own `update_panel`).
+- A pure no-op re-apply on an already-green selection journals nothing
+  and honestly reports "nothing to apply" — a later revert then reports
+  "nothing to revert"; this is exact-state semantics, not a failure.
+
+Measured on the live host (3 entities): `EPL_APPLY_SELECTION` 0.94 s and
+`EPL_REVERT_SELECTION` 0.93 s per automation roundtrip (~30 ms in warm
+context); the digest wire payload is a constant 33 B where the legacy
+handle list is `8·N + 25` B (50 000 entities: 400 025 B — 12 100×).
 
 ## Build
 
