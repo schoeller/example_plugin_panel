@@ -1,0 +1,4 @@
+# Build outputs
+/target/
+# Staged install packages for manual tests
+/_install/

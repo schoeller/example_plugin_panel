@@ -1,0 +1,28 @@
+# Open CAD Studio plugin manifest (pre-load discovery + API gate).
+#
+# `rustc_version` / `acadrust_source` are filled from the compiler and
+# Cargo.lock at install time (the same substitutions release.yml makes for
+# published assets):
+#   rustc_version = stamp of `rustc --version` used to build the cdylib
+#   acadrust_source = source line of the `opencadcodec` entry in Cargo.lock
+# The host loads the library only when both match its own build.
+
+[plugin]
+id = "schoeller.example_panel"
+name = "Panel Example"
+version = "0.1.0"
+description = "Reference dynamically-loaded add-on: a dockable side panel with live control events."
+author = "Sebastian Schoeller"
+license = "GPL-3.0-only"
+repository = "schoeller/example_plugin_panel"
+
+[opencad]
+# Keep in sync with the Rust manifest's `ApiVersion::CURRENT` — this is the
+# pre-load gate; the runner also checks the compiled-in symbol.
+api_version = 21
+rustc_version = "__RUSTC_VERSION__"
+acadrust_source = "__ACADRUST_SOURCE__"
+ribbon_order = 110
+command_prefixes = [
+    "EPL_",
+]
