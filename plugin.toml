@@ -10,7 +10,7 @@
 [plugin]
 id = "schoeller.example_panel"
 name = "Panel Example"
-version = "0.1.0"
+version = "0.3.0"
 description = "Reference dynamically-loaded add-on: a dockable side panel with live control events."
 author = "Sebastian Schoeller"
 license = "GPL-3.0-only"
