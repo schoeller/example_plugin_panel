@@ -516,12 +516,23 @@ fn extend_table_window(
     true
 }
 
-/// The widgets demo: publish the surface, then drive ONE cell-level patch
-/// (the single-cell wire fact). Returns whether every frame applied. Every
-/// exchange records its [`FrameFact`]; a non-applied publish restores the
-/// taken ack batch (the acknowledgment only rode an applied frame).
-pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
-    // (1) Snapshot leg of the widget surface (the publish that goes LIVE
+/// The snapshot leg of the widget demo (the publish that goes LIVE on the
+/// host's mount). This is ALSO the ensure-base step the widget-leg
+/// features call (only when the model holds no surface yet — a fresh
+/// fixture publish replaces the model, so callers gate it on
+/// `state.widgets.is_none()`). The refusal arm mirrors the store's own
+/// contract exactly ("a rejection leaves everything exactly as it was"):
+/// the model's revision claim is ROLLED BACK to the revision the leg still
+/// holds, the taken ack batch is restored (the acknowledgment only rode an
+/// applied frame), and the structured reject is recorded with the report's
+/// head — which RAISES the claim frontier above the store's truth (the
+/// realignment in [`DemoState::note_reject`]), so the next cycle's publish
+/// escapes the wedged lane instead of re-colliding with the store head.
+pub(crate) fn publish_widget_base(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+) -> bool {
+    // Snapshot leg of the widget surface (the publish that goes LIVE
     // on the host's mount).
     let surface = match demo_widget_surface(state.next_revision().0) {
         Ok(surface) => surface,
@@ -541,6 +552,7 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
                 FrameOutcome::Applied,
             );
             state.widgets = Some(surface);
+            true
         }
         host_wire::WireOutcome::Rejected { code, report } => {
             state.pending_ack = acks;
@@ -551,23 +563,35 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
                 code,
                 report.current_revision,
             );
-            return false;
+            false
         }
         host_wire::WireOutcome::Unserviceable(message) => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unserviceable(message));
-            return false;
+            false
         }
         host_wire::WireOutcome::Failed(error) => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::SendFailed(error));
-            return false;
+            false
         }
         host_wire::WireOutcome::Unexpected => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unexpected);
-            return false;
+            false
         }
+    }
+}
+
+/// The widgets demo: publish the surface, then drive ONE cell-level patch
+/// (the single-cell wire fact). Returns whether every frame applied. Every
+/// exchange records its [`FrameFact`]; a non-applied publish restores the
+/// taken ack batch (the acknowledgment only rode an applied frame).
+pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
+    // (1) Snapshot leg of the widget surface (the publish that goes LIVE
+    // on the host's mount).
+    if !publish_widget_base(sender, state) {
+        return false;
     }
 
     // (2) The one-cell patch: the `length` cell of row 305 — keyed, minimal.

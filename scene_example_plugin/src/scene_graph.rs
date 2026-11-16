@@ -77,7 +77,7 @@ fn add_node_card<'a>(
 /// sub-scope build gives the same builder-driven shapes. The inner
 /// `finish()` runs the same validator on the sub-scope; the demo's helpers
 /// add exactly one root by construction (pinned by the tests).
-fn built_element(
+pub(crate) fn built_element(
     build: impl FnOnce(&mut SceneBuilder) -> Result<&mut SceneBuilder, SceneError>,
 ) -> Result<SceneElement, SceneError> {
     let mut builder = SceneBuilder::new(0);
@@ -224,15 +224,18 @@ fn drop_marker_patch(
         .finish(successor.0)
 }
 
-/// Publish the graph scene and walk the three forward patches. Every frame
-/// carries the piggybacked event-ack leg (empties the pending batch);
-/// successes mirror the op into the plugin's own model so the next patch's
-/// base is honest. Every exchange records its [`FrameFact`] (the refusal
-/// report's material), and a non-applied publish RESTORES the taken ack
-/// batch — the merge acknowledgment only rode an APPLIED frame; the next
-/// publish still owes it.
-pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
-    // (1) Snapshot leg: the whole bounded scene at the next revision.
+/// The snapshot leg of the scene demo: the whole bounded scene at the
+/// next revision. This is ALSO the ensure-base step the other scene-leg
+/// features call (only when the model holds no scene yet — a fresh
+/// fixture publish replaces the model, so callers gate it on
+/// `state.scene.is_none()`). Every exchange records its [`FrameFact`]
+/// (the refusal report's material); a non-applied publish RESTORES the
+/// taken ack batch — the merge acknowledgment only rode an APPLIED frame;
+/// the next publish still owes it.
+pub(crate) fn publish_scene_base(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+) -> bool {
     let scene = match demo_graph_scene(state.next_revision().0) {
         Ok(scene) => scene,
         Err(_) => return false,
@@ -246,6 +249,7 @@ pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSta
             state.applied += 1;
             state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Applied);
             state.scene = Some(scene);
+            true
         }
         host_wire::WireOutcome::Rejected { code, report } => {
             state.pending_ack = acks;
@@ -256,23 +260,34 @@ pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSta
                 code,
                 report.current_revision,
             );
-            return false;
+            false
         }
         host_wire::WireOutcome::Unserviceable(message) => {
             state.pending_ack = acks;
             state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Unserviceable(message));
-            return false;
+            false
         }
         host_wire::WireOutcome::Failed(error) => {
             state.pending_ack = acks;
             state.note_frame("scene publish", None, Some(claimed), FrameOutcome::SendFailed(error));
-            return false;
+            false
         }
         host_wire::WireOutcome::Unexpected => {
             state.pending_ack = acks;
             state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Unexpected);
-            return false;
+            false
         }
+    }
+}
+
+/// Publish the graph scene and walk the three forward patches. Every frame
+/// carries the piggybacked event-ack leg (empties the pending batch);
+/// successes mirror the op into the plugin's own model so the next patch's
+/// base is honest.
+pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
+    // (1) Snapshot leg: the whole bounded scene at the next revision.
+    if !publish_scene_base(sender, state) {
+        return false;
     }
 
     // (2..=4) The three forward patches, one revision each, each built
