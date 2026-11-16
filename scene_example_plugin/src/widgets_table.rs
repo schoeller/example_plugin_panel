@@ -25,7 +25,7 @@ use ocs_plugin_api::scene::{SceneRevision, StableId};
 use ocs_plugin_api::widgets::{
     Axis, BadgeTone, CellKind, ConfirmPolicy, DomainRef, IconActionDef, IconRef, PanelTableDef,
     TableCell, TableColumnDef, TableRef, TableRowDef, TreeCapabilities, TreeRowDef,
-    WidgetCellValue, WidgetError, WidgetGroup, WidgetNode, WidgetOp, WidgetSurface,
+    WidgetCellValue, WidgetError, WidgetGroup, WidgetNode, WidgetOp, WidgetRange, WidgetSurface,
     WidgetSurfacePatch, WidgetTreeDef,
 };
 
@@ -311,7 +311,7 @@ pub fn cell_length_patch(base: u64, revision: u64, key: u64, value: f64) -> Widg
 }
 
 /// The model's tree def (the demo nests it under the single root group).
-fn find_tree_mut(surface: &mut WidgetSurface) -> Option<&mut WidgetTreeDef> {
+pub(crate) fn find_tree_mut(surface: &mut WidgetSurface) -> Option<&mut WidgetTreeDef> {
     surface.roots.iter_mut().find_map(|root| match root {
         WidgetNode::Group(group) => group.children.iter_mut().find_map(|node| match node {
             WidgetNode::Tree(tree) if tree.id.0 == TREE_WIDGET_ID => Some(tree),
@@ -319,6 +319,48 @@ fn find_tree_mut(surface: &mut WidgetSurface) -> Option<&mut WidgetTreeDef> {
         }),
         _ => None,
     })
+}
+
+/// The model's tree def (shared read).
+pub(crate) fn model_tree(state: &DemoState) -> Option<&WidgetTreeDef> {
+    surface_tree(state.widgets.as_ref()?)
+}
+
+/// The surface's demo tree def (shared read — the read twin of
+/// [`find_tree_mut`]).
+pub(crate) fn surface_tree(surface: &WidgetSurface) -> Option<&WidgetTreeDef> {
+    surface.roots.iter().find_map(|root| match root {
+        WidgetNode::Group(group) => group.children.iter().find_map(|node| match node {
+            WidgetNode::Tree(tree) if tree.id.0 == TREE_WIDGET_ID => Some(tree),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// `true` while the model's surface holds the WIDGET NODE id (groups
+/// descend; tree ROW ids live in the same namespace but need
+/// [`tree_holds_row`]).
+pub(crate) fn holds_widget_id(state: &DemoState, id: u64) -> bool {
+    let Some(surface) = state.widgets.as_ref() else {
+        return false;
+    };
+    let mut walker: Vec<&WidgetNode> = surface.roots.iter().collect();
+    while let Some(node) = walker.pop() {
+        if node.widget_id().0 == id {
+            return true;
+        }
+        if let WidgetNode::Group(group) = node {
+            walker.extend(group.children.iter());
+        }
+    }
+    false
+}
+
+/// `true` while the model's tree already carries the ROW id (the
+/// surface-wide namespace covers tree rows too).
+pub(crate) fn tree_holds_row(state: &DemoState, row: u64) -> bool {
+    model_tree(state).is_some_and(|tree| tree.rows.iter().any(|entry| entry.id.0 == row))
 }
 
 /// Advance the model's widget revision and publish the snapshot-cycle
@@ -430,8 +472,8 @@ pub fn deliver_pending(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSt
     let mut delivered = 0usize;
     for delivery in deliveries {
         let progressed = match delivery {
-            crate::state::PendingDelivery::TreeChildren { parent, range: _ } => {
-                append_lazy_children(state, parent)
+            crate::state::PendingDelivery::TreeChildren { parent, range } => {
+                append_lazy_children(state, parent, range)
             }
             crate::state::PendingDelivery::TablePage {
                 table,
@@ -448,13 +490,19 @@ pub fn deliver_pending(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSt
 }
 
 /// Append the backing children of one lazy branch into the model's tree
-/// (a repeat demand is a no-op — the rows are already published).
-fn append_lazy_children(state: &mut DemoState, parent: Option<StableId>) -> bool {
+/// (a repeat demand is a no-op — the rows are already published). The
+/// FIRST lazy branch (row 12) answers its whole small backing set; the
+/// PAGED branch (row 13, [`crate::tree_lazy`]) answers the ASKED WINDOW
+/// only — the next bounded page, never a re-answer for a satisfied one.
+fn append_lazy_children(state: &mut DemoState, parent: Option<StableId>, range: WidgetRange) -> bool {
     let Some(parent) = parent else {
         // Root rows: the demo tree's roots are fully published; nothing
         // exists beyond them — an honest no-op.
         return false;
     };
+    if parent.0 == crate::tree_lazy::PAGED_BRANCH_ROW {
+        return crate::tree_lazy::append_windowed_children(state, parent, range);
+    }
     let children = backing_tree_children(parent);
     if children.is_empty() {
         return false;
@@ -516,12 +564,23 @@ fn extend_table_window(
     true
 }
 
-/// The widgets demo: publish the surface, then drive ONE cell-level patch
-/// (the single-cell wire fact). Returns whether every frame applied. Every
-/// exchange records its [`FrameFact`]; a non-applied publish restores the
-/// taken ack batch (the acknowledgment only rode an applied frame).
-pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
-    // (1) Snapshot leg of the widget surface (the publish that goes LIVE
+/// The snapshot leg of the widget demo (the publish that goes LIVE on the
+/// host's mount). This is ALSO the ensure-base step the widget-leg
+/// features call (only when the model holds no surface yet — a fresh
+/// fixture publish replaces the model, so callers gate it on
+/// `state.widgets.is_none()`). The refusal arm mirrors the store's own
+/// contract exactly ("a rejection leaves everything exactly as it was"):
+/// the model's revision claim is ROLLED BACK to the revision the leg still
+/// holds, the taken ack batch is restored (the acknowledgment only rode an
+/// applied frame), and the structured reject is recorded with the report's
+/// head — which RAISES the claim frontier above the store's truth (the
+/// realignment in [`DemoState::note_reject`]), so the next cycle's publish
+/// escapes the wedged lane instead of re-colliding with the store head.
+pub(crate) fn publish_widget_base(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+) -> bool {
+    // Snapshot leg of the widget surface (the publish that goes LIVE
     // on the host's mount).
     let surface = match demo_widget_surface(state.next_revision().0) {
         Ok(surface) => surface,
@@ -541,6 +600,7 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
                 FrameOutcome::Applied,
             );
             state.widgets = Some(surface);
+            true
         }
         host_wire::WireOutcome::Rejected { code, report } => {
             state.pending_ack = acks;
@@ -551,23 +611,35 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
                 code,
                 report.current_revision,
             );
-            return false;
+            false
         }
         host_wire::WireOutcome::Unserviceable(message) => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unserviceable(message));
-            return false;
+            false
         }
         host_wire::WireOutcome::Failed(error) => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::SendFailed(error));
-            return false;
+            false
         }
         host_wire::WireOutcome::Unexpected => {
             state.pending_ack = acks;
             state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unexpected);
-            return false;
+            false
         }
+    }
+}
+
+/// The widgets demo: publish the surface, then drive ONE cell-level patch
+/// (the single-cell wire fact). Returns whether every frame applied. Every
+/// exchange records its [`FrameFact`]; a non-applied publish restores the
+/// taken ack batch (the acknowledgment only rode an applied frame).
+pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
+    // (1) Snapshot leg of the widget surface (the publish that goes LIVE
+    // on the host's mount).
+    if !publish_widget_base(sender, state) {
+        return false;
     }
 
     // (2) The one-cell patch: the `length` cell of row 305 — keyed, minimal.

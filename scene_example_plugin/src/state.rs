@@ -19,6 +19,11 @@ use ocs_plugin_api::widgets::{WidgetEvent, WidgetRange, WidgetSurface};
 // them; the demand mapping below references them by path.
 use crate::widgets_table;
 
+/// The interaction journal's cap (the debug dump quotes the tail).
+const JOURNAL_CAP: usize = 16;
+/// How many journal lines the debug dump quotes.
+const JOURNAL_TAIL: usize = 5;
+
 /// How one outbound frame's exchange ended, as the refusal report names it.
 /// This is the DIAGNOSTIC record (the state's tally of what the wire did),
 /// not a control path: the flows' behavior is identical without it.
@@ -147,6 +152,36 @@ pub struct DemoState {
     pub(crate) unserved_answers: u64,
     /// The model mirror refused after a wire-apply (the model lags).
     pub(crate) mirror_lags: u64,
+    // -- the showcase features' own books (all additive, all read back by
+    //    the debug report; every one of them feeds a pending queue that
+    //    inherits the refusal/rollback laws) --
+
+    /// Drag settles observed (`drag_settle` command events resolved
+    /// against the plugin's own model — the verbatim `DragMeta` source;
+    /// cancels emit NO event, so they move nothing and count nothing).
+    pub drag_settles: u64,
+    /// Settle events naming an address the plugin's model carries WITHOUT
+    /// drag meta (a defensive count — never queued for a move).
+    pub drag_unresolved: u64,
+    /// Authoritative settle moves that applied (one patch per settle).
+    pub drag_moves_applied: u64,
+    /// GUI cell edits accepted by validation (an ack patch is queued).
+    pub cell_edits_accepted: u64,
+    /// GUI cell edits REFUSED by validation (no partial writes — the
+    /// model is untouched).
+    pub cell_edits_refused: u64,
+    /// Cell-ack patch frames sent (the `SCN_DEMO_CELLEDIT` loop's leg).
+    pub cell_patch_frames: u64,
+    /// Authoritative settle moves not yet flushed (the `SCN_DEMO_DRAG`
+    /// feature's run flushes them, one patch each).
+    pub pending_moves: Vec<StableId>,
+    /// Validated GUI cell edits not yet acked (the `SCN_DEMO_CELLEDIT`
+    /// feature's run flushes them as ONE bounded cell patch).
+    pub pending_cell_acks: Vec<crate::cell_edit::CellAck>,
+    /// The bounded interaction journal (the SCN_DEBUG printout's legible
+    /// loop record — what the host sent, what the plugin validated, what
+    /// it answered). Oldest entries drop at [`JOURNAL_CAP`].
+    pub journal: Vec<String>,
 }
 
 impl std::fmt::Debug for DemoState {
@@ -173,6 +208,15 @@ impl std::fmt::Debug for DemoState {
             .field("send_failures", &self.send_failures)
             .field("unserved_answers", &self.unserved_answers)
             .field("mirror_lags", &self.mirror_lags)
+            .field("drag_settles", &self.drag_settles)
+            .field("drag_unresolved", &self.drag_unresolved)
+            .field("drag_moves_applied", &self.drag_moves_applied)
+            .field("cell_edits_accepted", &self.cell_edits_accepted)
+            .field("cell_edits_refused", &self.cell_edits_refused)
+            .field("cell_patch_frames", &self.cell_patch_frames)
+            .field("pending_moves", &self.pending_moves)
+            .field("pending_cell_acks", &self.pending_cell_acks)
+            .field("journal", &self.journal)
             .finish()
     }
 }
@@ -250,7 +294,10 @@ impl DemoState {
 
     /// The one-line `SCN_DEBUG` dump: the wire tallies, both legs' heads,
     ///the pending queues and the last recorded rejection — everything the
-    /// refusal reports quote, in one passive line.
+    /// refusal reports quote, in one passive line. Below the line: the
+    /// MCP-parity address list (what an MCP client would address — the
+    /// SAME host path the GUI uses, zero plugin-side extra work) and the
+    /// recent interaction journal (the legible loop record).
     pub fn debug_report(&self) -> String {
         let head = |summary: Option<SceneRevision>| match summary {
             Some(revision) => revision.0.to_string(),
@@ -261,11 +308,13 @@ impl DemoState {
         } else {
             self.pending_ack.len().to_string()
         };
-        format!(
+        let line = format!(
             "Scene Example debug: sent {}, applied {}, rejected {}, stale rejected {}, \
              recovered {}, pages delivered {}, model-lag {}, send fails {}, \
-             codeless answers {} | head {} | scene head {}, widget head {} | \
-             pending ack {}, pending deliver {} | last reject: {:?} | last frame: {:?}",
+             codeless answers {}, drag settles {}, moves applied {}, cell edits \
+             accepted {} refused {}, cell patches {} | head {} | scene head {}, widget head {} | \
+             pending ack {}, pending deliver {}, pending moves {}, pending cell acks {} | \
+             last reject: {:?} | last frame: {:?}",
             self.sent,
             self.applied,
             self.rejected,
@@ -275,13 +324,86 @@ impl DemoState {
             self.mirror_lags,
             self.send_failures,
             self.unserved_answers,
+            self.drag_settles,
+            self.drag_moves_applied,
+            self.cell_edits_accepted,
+            self.cell_edits_refused,
+            self.cell_patch_frames,
             self.head,
             head(self.scene_head()),
             head(self.widgets_head()),
             pending_ack_note,
             self.pending_deliveries.len(),
+            self.pending_moves.len(),
+            self.pending_cell_acks.len(),
             self.last_reject,
             self.last_frame,
+        );
+        format!(
+            "{line}\n  mcp: {}\n  journal: {}",
+            self.mcp_addresses(),
+            self.journal_tail(),
+        )
+    }
+
+    /// The journal tail the debug dump quotes (oldest → newest).
+    fn journal_tail(&self) -> String {
+        if self.journal.is_empty() {
+            return "(empty)".to_string();
+        }
+        let start = self.journal.len().saturating_sub(JOURNAL_TAIL);
+        self.journal[start..].join(" | ")
+    }
+
+    /// Record ONE legible line of the interaction journal (bounded — the
+    /// oldest line drops at the cap; this is the SCN_DEBUG printout's
+    /// material, never a control path).
+    pub(crate) fn journal_note(&mut self, line: String) {
+        if self.journal.len() >= JOURNAL_CAP {
+            self.journal.remove(0);
+        }
+        self.journal.push(line);
+    }
+
+    /// The MCP-parity address list: every showcased surface with the
+    /// addresses an MCP client uses against it. `panel_semantics` /
+    /// `panel_page` / `panel_widget_invoke` ride the SAME host path the
+    /// GUI uses — this plugin ships NO MCP code; the parity is automatic
+    /// because the tools address the very surfaces this plugin publishes.
+    pub fn mcp_addresses(&self) -> String {
+        format!(
+            "panel_semantics(panel \"{}\", surface {}) → tree {} (rows 1..=4, lazy {} and {}; \
+             children {}..={} / {}..={}), button {}, menu {} (submenu {}), list {} (items \
+             {}..={}), table ref {} | panel_page(table {}, cols {}..={}, keys {}..={} \
+             total {}; TreeChildren parent {}|{}) | panel_widget_invoke(commands {:?} + \
+             widget commands scn_delete_node, scn_menu_*, scn_list_layer; host drag \
+             settle = \"{}\")",
+            crate::scene_graph::PANEL_ID,
+            crate::widgets_table::ROOT_GROUP_ID,
+            crate::widgets_table::TREE_WIDGET_ID,
+            crate::widgets_table::LAZY_BRANCH_ROW,
+            crate::tree_lazy::PAGED_BRANCH_ROW,
+            crate::widgets_table::LAZY_CHILDREN_BASE,
+            crate::widgets_table::LAZY_CHILDREN_BASE + crate::widgets_table::LAZY_CHILDREN_COUNT as u64 - 1,
+            crate::tree_lazy::PAGED_CHILDREN_BASE,
+            crate::tree_lazy::PAGED_CHILDREN_BASE + crate::tree_lazy::PAGED_CHILDREN_COUNT as u64 - 1,
+            crate::widgets_table::DELETE_BUTTON_ID,
+            crate::menu_list::MENU_ID,
+            crate::menu_list::MENU_SUBMENU_ID,
+            crate::menu_list::LIST_ID,
+            crate::menu_list::LIST_FIRST_ITEM,
+            crate::menu_list::LIST_FIRST_ITEM + crate::menu_list::LIST_ITEM_COUNT as u64 - 1,
+            crate::widgets_table::TABLE_REF_WIDGET_ID,
+            crate::widgets_table::TABLE_ID,
+            crate::widgets_table::COL_ITEM,
+            crate::widgets_table::COL_STATE,
+            crate::widgets_table::FIRST_ROW_KEY,
+            crate::widgets_table::FIRST_ROW_KEY + crate::widgets_table::TABLE_TOTAL_ROWS - 1,
+            crate::widgets_table::TABLE_TOTAL_ROWS,
+            crate::widgets_table::LAZY_BRANCH_ROW,
+            crate::tree_lazy::PAGED_BRANCH_ROW,
+            crate::feature_commands(),
+            crate::drag_demo::DRAG_SETTLE_COMMAND,
         )
     }
 
@@ -337,7 +459,22 @@ impl DemoState {
                     command_id,
                     target_ids,
                     ..
-                } => self.commands_invoked.push((command_id, target_ids)),
+                } => {
+                    self.commands_invoked.push((command_id.clone(), target_ids.clone()));
+                    // The mount's DRAG settle hand-off: ONE
+                    // CommandInvoked bound to the dragged element's
+                    // address ("drag_settle" is the mount's v1
+                    // spelling). The plugin resolves the element's
+                    // DragMeta verbatim out of ITS OWN model (the wire
+                    // never echoes the meta — the documented INT-5 law);
+                    // a cancel converts to NO event at all, so it moves
+                    // nothing and counts nothing.
+                    if command_id == crate::drag_demo::DRAG_SETTLE_COMMAND {
+                        for address in target_ids {
+                            crate::drag_demo::note_settle(self, address);
+                        }
+                    }
+                }
                 WidgetEvent::ItemActivated { item_id, .. } => self.activations.push(item_id),
                 WidgetEvent::ChildrenRequested {
                     parent_id, range, ..
@@ -357,11 +494,18 @@ impl DemoState {
                     first_key,
                     len,
                 }),
-                // A typed-table cell fact: the READ/notify shape of what
-                // this plugin itself publishes as patch data (the
-                // events-vs-patches split) — merge-nothing; the state's own
-                // registry rows stay authoritative.
-                WidgetEvent::TableCellChanged { .. } => {}
+                // A typed-table cell fact: the host's GUI commit (the
+                // two-phase pointer / keyboard edit loop). The plugin
+                // validates the fact against its own model, applies it
+                // and acks with ONE cell patch (the patch = data leg of
+                // the events-vs-patches split); an invalid value is
+                // refused with the model untouched.
+                WidgetEvent::TableCellChanged {
+                    row_key,
+                    column_id,
+                    value,
+                    ..
+                } => crate::cell_edit::note_cell_changed(self, row_key, column_id, value),
                 // Expansion is host-local presentation state (the semantic
                 // notification rides only on lazy rows, which this demo
                 // works through `ChildrenRequested`).

@@ -103,21 +103,60 @@ handle list is `8·N + 25` B (50 000 entities: 400 025 B — 12 100×).
 ## The scene example crate (`scene_example_plugin/`)
 
 The API v24 sibling of this panel example — same cdylib shape, same
-standalone workspace, same `../OpenCADStudio` path dependency —
+standalone workspace, same `../../OpenCADStudio` path dependency —
 demonstrating the scene/widget wire (ADR-008): it declares
 `[opencad] api_version = 24` (compiled against the api crate at the v24
 tip; plugin version `0.4.0` — the next iteration after this crate's
 `0.3.0`), and shows the full publish-or-patch contract headlessly (every
 flow is reachable through `cargo test` without a running host; a
 `PluginRequestSender` double serves the four v24 tails with the host
-store's documented semantics):
+store's documented semantics).
 
-| Flow | Where | Wire pieces |
-|------|-------|-------------|
-| Graph scene demo | `SCN_DEMO_SCENE` / `src/scene_graph.rs` | `PanelScene` via `SceneBuilder` (cards + ports + edges + one `Group.clip` + a label per card), published with `PanelScenePublish`, then three `PanelScenePatch` frames (`Add`/`Replace`/`Remove`, fresh base + strictly greater successor each) |
-| Typed-table widget demo | `SCN_DEMO_WIDGETS` / `src/widgets_table.rs` | `WidgetSurface` (Tree with a `lazy_children` branch + `ConfirmPolicy::Prompt` IconButton + Table ref into the typed-table registry), one-cell `WidgetOp::TableCell` patch (≤300 B — the single-cell minimality), `TablePageRequested` / `PanelStoreDemand` answered by the documented snapshot-cycle publish |
-| Interaction roundtrip | `SCN_DELIVER` / `src/state.rs` | `HostNotification::PanelSceneEvents` merges selections/commands/activations newest-wins and queues the merge-acknowledgment that rides the next publish's event leg |
-| Stale-base conflict demo | `SCN_DEMO_STALE` / `src/recovery.rs` | a stale patch → `PatchRejected{StaleBase}` (the bounded report names the head) → `PanelSceneSnapshot2` digest + leading window → re-patch from the authoritative revision |
+The crate is structured around a **`DemoFeature` seam**: one capability
+= one self-contained module (id, `SCN_` commands, fixture builders, event
+handling, expected-observation note) = one row in the ONE registration
+table (`src/lib.rs::FEATURES`); the ribbon groups, command dispatch,
+`SCN_HELP` index, MCP address list and the refusal-report grammar are all
+data-driven off that table. **Adding panel functionality = write a module
++ add one registration line.**
+
+| Flow | Command | Where | Wire pieces |
+|------|---------|-------|-------------|
+| Graph scene demo | `SCN_DEMO_SCENE` | `src/scene_graph.rs` | `PanelScene` via `SceneBuilder` (cards + ports + edges + one `Group.clip` + a label per card), published with `PanelScenePublish`, then three `PanelScenePatch` frames (`Add`/`Replace`/`Remove`, fresh base + strictly greater successor each) |
+| Typed-table widget demo | `SCN_DEMO_WIDGETS` | `src/widgets_table.rs` | `WidgetSurface` (Tree with a `lazy_children` branch + `ConfirmPolicy::Prompt` IconButton + Table ref into the typed-table registry), one-cell `WidgetOp::TableCell` patch (≤300 B — the single-cell minimality), `TablePageRequested` / `PanelStoreDemand` answered by the documented snapshot-cycle publish |
+| Interaction roundtrip | `SCN_DELIVER` | `src/state.rs` | `HostNotification::PanelSceneEvents` merges selections/commands/activations newest-wins and queues the merge-acknowledgment that rides the next publish's event leg |
+| Stale-base conflict demo | `SCN_DEMO_STALE` | `src/recovery.rs` | a stale patch → `PatchRejected{StaleBase}` (the bounded report names the head) → `PanelSceneSnapshot2` digest + leading window → re-patch from the authoritative revision |
+| Drag demo | `SCN_DEMO_DRAG` | `src/drag_demo.rs` | a scene `Rect` carrying `DragMeta` — the host runs Begin/host-local preview/Settle; the settle arrives as ONE `CommandInvoked("drag_settle", [address])` (the mount's landed hand-off; the meta is NEVER echoed — the plugin resolves it verbatim from its own model) and the plugin moves the node authoritatively with exactly ONE patch; a cancel emits NO event and moves nothing |
+| Menu + List demo | `SCN_DEMO_MENU` | `src/menu_list.rs` | a `MenuDef` (submenu + shortcut + one `ConfirmPolicy::Prompt` item) and an `ItemListDef` patched onto the live surface with ONE two-op `WidgetOp::Add` patch; invocations (`CommandInvoked`) and activations (`ItemActivated`) ride the ordinary event stream |
+| Lazy-children tree demo | `SCN_DEMO_TREE` | `src/tree_lazy.rs` | an expandable branch with NO static children (`lazy_children=true`, one `WidgetOp::Update` over the tree); every `ChildrenRequested` ask is answered with the NEXT bounded 4-row page via the snapshot cycle — satisfied windows are never re-answered |
+| GUI cell-edit closed loop | `SCN_DEMO_CELLEDIT` | `src/cell_edit.rs` | THE headline: the user edits a cell IN THE HOST (two-phase pointer / keyboard) → `TableCellChanged` arrives → the plugin validates against its model → applies → acks with ONE bounded `WidgetOp::TableCell` patch; an invalid value (negative length, unknown key, badge write) is refused with zero partial writes; the loop prints legibly through the `SCN_DEBUG` journal |
+| AssetRef + theming demo | `SCN_DEMO_ASSET` | `src/asset_scene.rs` | one `SceneElement::Asset` (an opaque host-managed uri — no bytes on the wire) plus a theme-token vs fixed-`Rgba8` swatch pair in one patch |
+| Owner-law demo | `SCN_DEMO_OWNER` | `src/owner_law.rs` | a second publisher's publish of the LIVE panel id is refused `PatchRejected{PublisherOwnedByOther}` — structured, zero mutation (proven headless against the mirrored multi-plugin double; the demo never fights the real host) |
+| Diagnostics | `SCN_DEBUG` | `src/state.rs` | one passive line of the wire tallies both refusal arms quote, the showcase counters, the bounded interaction journal, and the MCP-parity address list |
+| Feature index | `SCN_HELP` | `src/lib.rs` | the `FEATURES` table printed: every feature's commands + its expected observation |
+
+### Coverage matrix (feature × command × what-to-observe)
+
+| # | Feature | Command | What to observe |
+|---|---------|---------|-----------------|
+| 1 | Graph scene | `SCN_DEMO_SCENE` | Four node cards + the clipped legend render; after the run node D and its edge are ADDED, B's label is REPLACED, the focus marker is REMOVED (one revision per patch frame). |
+| 2 | Typed table | `SCN_DEMO_WIDGETS` | The mount shows a REAL interactive typed table (first 8 of 40 rows); a plugin-side one-cell patch moved row 305's length to 9.75. Edit a cell in the host to close the loop (see #8). |
+| 3 | Stale recovery | `SCN_DEMO_STALE` | One deliberately stale patch is refused `StaleBase` (the report names the host head); the snapshot2 digest re-synchronizes and the re-patch lands the recovered label. |
+| 4 | Deliver | `SCN_DELIVER` | Queued demand answers (lazy children / table windows) flush as one snapshot-cycle publish each; nothing new is built. |
+| 5 | Drag | `SCN_DEMO_DRAG` | The accent Drag card (`scn-drag:node-1`) is armed; drag it IN THE HOST, then run the command again: the settle moves it authoritatively with exactly ONE patch. A cancel moves nothing (cancel emits no event). Counters stay 1:1 with settles (`SCN_DEBUG`). |
+| 6 | Menu + List | `SCN_DEMO_MENU` | The panel grows a Menu (Fit/`F`, a Zoom submenu `+`/`-`, and an Export item the host confirms via `ConfirmPolicy::Prompt`) and a four-item Layer List; menu invocations and item activations arrive as ordinary events. |
+| 7 | Lazy tree pages | `SCN_DEMO_TREE` | The tree gains the `Sheets (lazy)` branch (10 backing children); expanding it asks `ChildrenRequested` and every ask is answered with the next bounded 4-row page — a repeat ask answers nothing. |
+| 8 | Cell-edit loop | `SCN_DEMO_CELLEDIT` | A host-side cell edit (two-phase click or keyboard) arrives as `TableCellChanged`, is validated, applied to the model and acked with ONE cell patch; a negative length is refused with the model untouched. The `SCN_DEBUG` journal prints each step. |
+| 9 | Asset + theme | `SCN_DEMO_ASSET` | The scene gains a host-managed SVG asset (`host://icons/scn-mark.svg`) and a swatch pair: the `Theme(Accent)` swatch follows the host theme; the fixed `RGBA(155,89,182)` swatch never changes. |
+| 10 | Owner law | `SCN_DEMO_OWNER` | A second publisher's publish of the live panel id is refused `PublisherOwnedByOther` — structured, zero mutation; the plugin's ack leg is restored and its claim frontier realigns. |
+| 11 | MCP parity | `SCN_DEBUG` | The `mcp:` section lists the addresses an MCP client uses — `panel_semantics(panel "scn_panel", surface 90)`, `panel_page(table 200, cols 201..=204, keys 300..=339; TreeChildren parent 12|13)`, `panel_widget_invoke(commands …)` — the SAME host path the GUI uses; the plugin ships zero MCP code. |
+| 12 | Index | `SCN_HELP` | The feature table itself: id, commands, expected observation — the registration table is the documentation surface. |
+
+The plugin-authoring recipe guide that walks through all of it —
+manifest, publish→patch lifecycle, the event table, commands + confirm
+policies, typed tables + paging, MCP parity, the laws checklist, and the
+headless testing pattern — is
+[`scene_example_plugin/PLUGIN-AUTHORING.md`](scene_example_plugin/PLUGIN-AUTHORING.md).
 
 Build and test it from its own directory (it self-scopes its workspace
 like this crate does): `cd scene_example_plugin && cargo test`. The panel
