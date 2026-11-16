@@ -2,3 +2,8 @@
 /target/
 # Staged install packages for manual tests
 /_install/
+# The OpenCADStudio sibling checkout the path dependency points at:
+# present side by side in the canonical layouts (see README); the
+# work-tree keeps it as a local symlink so the same relative path
+# resolves for BOTH example crates here. Never committed.
+/OpenCADStudio

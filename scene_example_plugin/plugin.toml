@@ -1,0 +1,30 @@
+# Open CAD Studio plugin manifest (pre-load discovery + API gate).
+#
+# `rustc_version` / `acadrust_source` are filled from the compiler and
+# Cargo.lock at install time (the same substitutions release.yml makes for
+# published assets). From API v14 the self-hosted runner makes neither a
+# load condition — they stay for the published-asset shape (see the API v14+
+# note in the repo README).
+# The host loads the library only after the `[opencad] api_version` gate and
+# the compiled-in symbol agree.
+
+[plugin]
+id = "schoeller.scene_example"
+name = "Scene Example"
+version = "0.4.0"
+description = "Reference API v24 add-on: a scene-on-a-panel demo (graph cards, typed tables, stale-base recovery)."
+author = "Sebastian Schoeller"
+license = "GPL-3.0-only"
+repository = "schoeller/example_plugin_panel"
+
+[opencad]
+# Keep in sync with the Rust manifest's `ApiVersion::CURRENT` — this is the
+# pre-load gate (API_VERSION_MIN_SUPPORTED=3 .. the host's API major, 24);
+# the runner also checks the compiled-in `ocs_plugin_api_version` symbol.
+api_version = 24
+rustc_version = "__RUSTC_VERSION__"
+acadrust_source = "__ACADRUST_SOURCE__"
+ribbon_order = 120
+command_prefixes = [
+    "SCN_",
+]

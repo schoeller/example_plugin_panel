@@ -100,6 +100,29 @@ Measured on the live host (3 entities): `EPL_APPLY_SELECTION` 0.94 s and
 context); the digest wire payload is a constant 33 B where the legacy
 handle list is `8·N + 25` B (50 000 entities: 400 025 B — 12 100×).
 
+## The scene example crate (`scene_example_plugin/`)
+
+The API v24 sibling of this panel example — same cdylib shape, same
+standalone workspace, same `../OpenCADStudio` path dependency —
+demonstrating the scene/widget wire (ADR-008): it declares
+`[opencad] api_version = 24` (compiled against the api crate at the v24
+tip; plugin version `0.4.0` — the next iteration after this crate's
+`0.3.0`), and shows the full publish-or-patch contract headlessly (every
+flow is reachable through `cargo test` without a running host; a
+`PluginRequestSender` double serves the four v24 tails with the host
+store's documented semantics):
+
+| Flow | Where | Wire pieces |
+|------|-------|-------------|
+| Graph scene demo | `SCN_DEMO_SCENE` / `src/scene_graph.rs` | `PanelScene` via `SceneBuilder` (cards + ports + edges + one `Group.clip` + a label per card), published with `PanelScenePublish`, then three `PanelScenePatch` frames (`Add`/`Replace`/`Remove`, fresh base + strictly greater successor each) |
+| Typed-table widget demo | `SCN_DEMO_WIDGETS` / `src/widgets_table.rs` | `WidgetSurface` (Tree with a `lazy_children` branch + `ConfirmPolicy::Prompt` IconButton + Table ref into the typed-table registry), one-cell `WidgetOp::TableCell` patch (≤300 B — the single-cell minimality), `TablePageRequested` / `PanelStoreDemand` answered by the documented snapshot-cycle publish |
+| Interaction roundtrip | `SCN_DELIVER` / `src/state.rs` | `HostNotification::PanelSceneEvents` merges selections/commands/activations newest-wins and queues the merge-acknowledgment that rides the next publish's event leg |
+| Stale-base conflict demo | `SCN_DEMO_STALE` / `src/recovery.rs` | a stale patch → `PatchRejected{StaleBase}` (the bounded report names the head) → `PanelSceneSnapshot2` digest + leading window → re-patch from the authoritative revision |
+
+Build and test it from its own directory (it self-scopes its workspace
+like this crate does): `cd scene_example_plugin && cargo test`. The panel
+registers as `scn_panel` (commands `SCN_*`); `SCN_OPEN` toggles it.
+
 ## Build
 
 The WSL checkout (`~/opencode/plugin_panel_register`) is the source of truth;
