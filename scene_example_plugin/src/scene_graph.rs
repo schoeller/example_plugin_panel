@@ -25,7 +25,7 @@ use ocs_plugin_api::scene::{
 use ocs_plugin_api::scene_builder::{PatchBuilder, SceneBuilder};
 
 use crate::host_wire;
-use crate::state::DemoState;
+use crate::state::{DemoState, FrameOutcome};
 
 /// The demo panel id — the same id the panel registration used; ownership
 /// is transport-authenticated, so this field is a name, not a credential.
@@ -227,31 +227,52 @@ fn drop_marker_patch(
 /// Publish the graph scene and walk the three forward patches. Every frame
 /// carries the piggybacked event-ack leg (empties the pending batch);
 /// successes mirror the op into the plugin's own model so the next patch's
-/// base is honest.
+/// base is honest. Every exchange records its [`FrameFact`] (the refusal
+/// report's material), and a non-applied publish RESTORES the taken ack
+/// batch — the merge acknowledgment only rode an APPLIED frame; the next
+/// publish still owes it.
 pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
     // (1) Snapshot leg: the whole bounded scene at the next revision.
     let scene = match demo_graph_scene(state.next_revision().0) {
         Ok(scene) => scene,
         Err(_) => return false,
     };
+    let claimed = scene.revision.0;
+    let acks = std::mem::take(&mut state.pending_ack);
     state.sent += 1;
-    match host_wire::send_scene_publish(
-        sender,
-        PANEL_ID,
-        scene.clone(),
-        std::mem::take(&mut state.pending_ack),
-    ) {
+    match host_wire::send_scene_publish(sender, PANEL_ID, scene.clone(), acks.clone()) {
         host_wire::WireOutcome::Applied { revision, .. } => {
             debug_assert_eq!(revision, scene.revision);
             state.applied += 1;
+            state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Applied);
             state.scene = Some(scene);
         }
         host_wire::WireOutcome::Rejected { code, report } => {
-            state.rejected += 1;
-            state.last_reject = Some((code, report.current_revision));
+            state.pending_ack = acks;
+            state.note_reject(
+                "scene publish",
+                None,
+                Some(claimed),
+                code,
+                report.current_revision,
+            );
             return false;
         }
-        _ => return false,
+        host_wire::WireOutcome::Unserviceable(message) => {
+            state.pending_ack = acks;
+            state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Unserviceable(message));
+            return false;
+        }
+        host_wire::WireOutcome::Failed(error) => {
+            state.pending_ack = acks;
+            state.note_frame("scene publish", None, Some(claimed), FrameOutcome::SendFailed(error));
+            return false;
+        }
+        host_wire::WireOutcome::Unexpected => {
+            state.pending_ack = acks;
+            state.note_frame("scene publish", None, Some(claimed), FrameOutcome::Unexpected);
+            return false;
+        }
     }
 
     // (2..=4) The three forward patches, one revision each, each built
@@ -264,6 +285,8 @@ pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSta
         let Ok(patch) = step(base, state) else {
             return false;
         };
+        let base_revision = patch.base_revision.0;
+        let claimed = patch.revision.0;
         state.sent += 1;
         match host_wire::send_scene_patch(sender, PANEL_ID, patch.clone()) {
             host_wire::WireOutcome::Applied { revision, .. } => {
@@ -272,16 +295,44 @@ pub fn run_scene_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSta
                     return false;
                 };
                 if scene.apply_patch(patch).is_err() {
+                    state.note_frame(
+                        "scene patch",
+                        Some(base_revision),
+                        Some(claimed),
+                        FrameOutcome::AppliedModelLagged(revision.0),
+                    );
                     return false;
                 }
                 debug_assert_eq!(scene.revision, revision, "model and host agree");
+                state.note_frame(
+                    "scene patch",
+                    Some(base_revision),
+                    Some(claimed),
+                    FrameOutcome::Applied,
+                );
             }
             host_wire::WireOutcome::Rejected { code, report } => {
-                state.rejected += 1;
-                state.last_reject = Some((code, report.current_revision));
+                state.note_reject(
+                    "scene patch",
+                    Some(base_revision),
+                    Some(claimed),
+                    code,
+                    report.current_revision,
+                );
                 return false;
             }
-            _ => return false,
+            host_wire::WireOutcome::Unserviceable(message) => {
+                state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unserviceable(message));
+                return false;
+            }
+            host_wire::WireOutcome::Failed(error) => {
+                state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::SendFailed(error));
+                return false;
+            }
+            _ => {
+                state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unexpected);
+                return false;
+            }
         }
     }
     true
@@ -486,5 +537,59 @@ mod tests {
                 "PanelScenePatch",
             ]
         );
+    }
+
+    /// The scene-leg twin of the widget-cycle restoration: a REFUSED
+    /// publish restores the taken ack batch (the frame did not apply, so
+    /// the acknowledgment is still owed) and the reject report's head
+    /// raises the claim frontier above BOTH stored legs (the one-cadence
+    /// law), so the next run publishes cleanly past the wedge.
+    #[test]
+    fn refused_scene_publish_restores_acks_and_realigns_frontier() {
+        use ocs_plugin_api::ipc::protocol::PatchRejectCode;
+        use ocs_plugin_api::widgets::WidgetEvent;
+
+        let host: Arc<FakeWireHost> = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(super::run_scene_demo(&sender, &mut state));
+        assert!(crate::widgets_table::run_widgets_demo(&sender, &mut state));
+        assert_eq!(state.head, 6);
+
+        // The live loop's pending state: one merged event batch.
+        let surface_id = state.widgets_surface_id().expect("published");
+        state.handle_events(
+            surface_id,
+            vec![WidgetEvent::SelectionChanged {
+                surface_id,
+                selected_ids: vec![StableId(1)],
+            }],
+        );
+
+        // THE WEDGE: the frontier rewound below both legs (the
+        // lost-response shape).
+        state.head = 0;
+        assert!(!super::run_scene_demo(&sender, &mut state));
+        assert_eq!(
+            state.pending_ack.len(),
+            1,
+            "the refused publish's ack batch is owed again"
+        );
+        assert_eq!(
+            state.head, 6,
+            "the report's head raised the frontier above BOTH stored legs"
+        );
+        assert_eq!(
+            state.last_reject,
+            Some((PatchRejectCode::NonMonotonicRevision, Some(SceneRevision(4)))),
+            "naming the scene leg's own head (the report's recovery fact)"
+        );
+        assert_eq!(host.scene_head(), Some(SceneRevision(4)), "zero mutation");
+
+        // THE HEAL: the next run publishes from the realigned frontier.
+        assert!(super::run_scene_demo(&sender, &mut state));
+        assert_eq!(state.head, 10, "4 scene frames from 7");
+        assert_eq!(host.scene_head(), Some(SceneRevision(10)));
     }
 }

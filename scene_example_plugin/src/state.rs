@@ -19,6 +19,50 @@ use ocs_plugin_api::widgets::{WidgetEvent, WidgetRange, WidgetSurface};
 // them; the demand mapping below references them by path.
 use crate::widgets_table;
 
+/// How one outbound frame's exchange ended, as the refusal report names it.
+/// This is the DIAGNOSTIC record (the state's tally of what the wire did),
+/// not a control path: the flows' behavior is identical without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FrameOutcome {
+    /// `PatchApplied` — the host adopted the frame's revision.
+    Applied,
+    /// A structured `PatchRejected`: the code plus the report's head (the
+    /// recovery fact — `None` when the code left the revision unknown).
+    Rejected(PatchRejectCode, Option<u64>),
+    /// The frame applied on the wire but the plugin's own model mirror
+    /// refused — the model now LAGS the host (the run's report must name
+    /// it: the host head is the truth the next frame has to rebuild from).
+    AppliedModelLagged(u64),
+    /// The request line itself answered an error — no host answer exists
+    /// (the wire note carries the transport's text verbatim).
+    SendFailed(String),
+    /// An answer arrived that NAMES NO CODE: the wire's plain `Error`
+    /// text — on the live host this is exactly the V4 nested-serving
+    /// guard's refusal ("nested plugin request for tab … cannot be served
+    /// inline while the host dispatches to …"). Recorded verbatim so the
+    /// next run names the real cause instead of a generic line.
+    Unserviceable(String),
+    /// A decodable answer that is neither an ack nor a structured reject.
+    Unexpected,
+}
+
+/// One outbound frame's journal fact (the refusal printout's material):
+/// the leg the frame rode, the base/claimed revision it named, and how the
+/// exchange ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameFact {
+    /// "scene publish" / "scene patch" / "widget publish" / "widget patch"
+    /// / "snapshot2" — the leg name the printout quotes.
+    pub leg: &'static str,
+    /// The frame's base revision when the frame names one (a publish or a
+    /// read has none).
+    pub base: Option<u64>,
+    /// The frame's claimed successor revision when it claims one.
+    pub next: Option<u64>,
+    /// How the exchange ended.
+    pub outcome: FrameOutcome,
+}
+
 /// One queued answer to a host store demand (the `PanelStoreDemand`
 /// notification or its `WidgetEvent::ChildrenRequested` /
 /// `TablePageRequested` shorthand). The plugin works through these by
@@ -91,6 +135,18 @@ pub struct DemoState {
     /// The latest structured rejection (the recovery report the tests
     /// read).
     pub last_reject: Option<(PatchRejectCode, Option<SceneRevision>)>,
+    /// Diagnostic record of THE LAST outbound frame of the CURRENT
+    /// exchange (`begin_flow` clears it; every send site in the flows
+    /// re-records): the leg, base/claimed revision and wire outcome the
+    /// refusal report quotes. Cleared per flow run so a print names THIS
+    /// run's refusal, never a stale one.
+    pub(crate) last_frame: Option<FrameFact>,
+    /// Frames whose exchange ended at the REQUEST LINE (`SendFailed`).
+    pub(crate) send_failures: u64,
+    /// Answers that NAMED NO CODE (`Unserviceable` / `Unexpected`).
+    pub(crate) unserved_answers: u64,
+    /// The model mirror refused after a wire-apply (the model lags).
+    pub(crate) mirror_lags: u64,
 }
 
 impl std::fmt::Debug for DemoState {
@@ -113,11 +169,122 @@ impl std::fmt::Debug for DemoState {
             .field("stale_rejections", &self.stale_rejections)
             .field("recoveries", &self.recoveries)
             .field("last_reject", &self.last_reject)
+            .field("last_frame", &self.last_frame)
+            .field("send_failures", &self.send_failures)
+            .field("unserved_answers", &self.unserved_answers)
+            .field("mirror_lags", &self.mirror_lags)
             .finish()
     }
 }
 
 impl DemoState {
+    /// Diagnostic hygiene at the START of one `run_command` exchange: the
+    /// per-run frame record clears (a refusal print must name THIS run's
+    /// exchange); the RUNNING tallies and the historical `last_reject`
+    /// stay.
+    pub(crate) fn begin_flow(&mut self) {
+        self.last_frame = None;
+    }
+
+    /// Record ONE frame's exchange outcome (the refusal print's material)
+    /// and keep the wire-level counters. Diagnostic-only: no flow branch
+    /// reads it; the flows' boolean behavior is untouched by the record.
+    pub(crate) fn note_frame(
+        &mut self,
+        leg: &'static str,
+        base: Option<u64>,
+        next: Option<u64>,
+        outcome: FrameOutcome,
+    ) {
+        match &outcome {
+            FrameOutcome::Applied => {}
+            FrameOutcome::AppliedModelLagged(_) => self.mirror_lags += 1,
+            FrameOutcome::Rejected(..) => {}
+            FrameOutcome::SendFailed(_) => self.send_failures += 1,
+            FrameOutcome::Unserviceable(_) | FrameOutcome::Unexpected => {
+                self.unserved_answers += 1;
+            }
+        }
+        self.last_frame = Some(FrameFact {
+            leg,
+            base,
+            next,
+            outcome,
+        });
+    }
+
+    /// The structured refusal's shared recording (the flows' ONE mutation
+    /// path — `last_reject` keeps the recovery fact the tests read), plus
+    /// THE REALIGNMENT: a structured rejection proves zero mutation on the
+    /// host, and the `PatchRejectReport` names the host's head — the claim
+    /// frontier rises to that truth (and above both stored legs) so the
+    /// NEXT frame leaves the wedged lane. Before this, a wedged lane (a
+    /// loss whose frontier sat below a store head the plugin never
+    /// observed) first re-clashed with the store head — equal-revision,
+    /// different-content refusals — before climbing past it; with the
+    /// report's head on record the next claim is strictly above every
+    /// stored leg head, so NO retry is spent on a collision the plugin
+    /// already knew about.
+    pub(crate) fn note_reject(
+        &mut self,
+        leg: &'static str,
+        base: Option<u64>,
+        next: Option<u64>,
+        code: PatchRejectCode,
+        current: Option<SceneRevision>,
+    ) {
+        self.last_reject = Some((code, current));
+        self.note_frame(leg, base, next, FrameOutcome::Rejected(code, current.map(|r| r.0)));
+        let reported_floor = current.map(|r| r.0).unwrap_or(0);
+        let stored_floor = self
+            .scene_head()
+            .map(|revision| revision.0)
+            .unwrap_or(0)
+            .max(self.widgets_head().map(|revision| revision.0).unwrap_or(0));
+        let floor = reported_floor.max(stored_floor);
+        if floor > self.head {
+            self.head = floor;
+        }
+        self.rejected += 1;
+    }
+
+    /// The one-line `SCN_DEBUG` dump: the wire tallies, both legs' heads,
+    ///the pending queues and the last recorded rejection — everything the
+    /// refusal reports quote, in one passive line.
+    pub fn debug_report(&self) -> String {
+        let head = |summary: Option<SceneRevision>| match summary {
+            Some(revision) => revision.0.to_string(),
+            None => "—".to_string(),
+        };
+        let pending_ack_note = if self.pending_ack.is_empty() {
+            "0".to_string()
+        } else {
+            self.pending_ack.len().to_string()
+        };
+        format!(
+            "Scene Example debug: sent {}, applied {}, rejected {}, stale rejected {}, \
+             recovered {}, pages delivered {}, model-lag {}, send fails {}, \
+             codeless answers {} | head {} | scene head {}, widget head {} | \
+             pending ack {}, pending deliver {} | last reject: {:?} | last frame: {:?}",
+            self.sent,
+            self.applied,
+            self.rejected,
+            self.stale_rejections,
+            self.recoveries,
+            self.pages_delivered,
+            self.mirror_lags,
+            self.send_failures,
+            self.unserved_answers,
+            self.head,
+            head(self.scene_head()),
+            head(self.widgets_head()),
+            pending_ack_note,
+            self.pending_deliveries.len(),
+            self.last_reject,
+            self.last_frame,
+        )
+    }
+
     /// The revision to submit next (strictly above `head` — the successor
     /// monotonicity every leg's apply demands, and above both legs because
     /// the panel shares ONE cadence).

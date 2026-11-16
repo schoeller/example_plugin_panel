@@ -31,7 +31,7 @@ use ocs_plugin_api::widgets::{
 
 use crate::host_wire;
 use crate::scene_graph::PANEL_ID;
-use crate::state::DemoState;
+use crate::state::{DemoState, FrameOutcome};
 
 pub const ROOT_GROUP_ID: u64 = 90;
 pub const TREE_WIDGET_ID: u64 = 100;
@@ -326,22 +326,31 @@ fn find_tree_mut(surface: &mut WidgetSurface) -> Option<&mut WidgetTreeDef> {
 /// merged since the last publish. This is the documented answer shape for
 /// table-page / lazy-children demands ("the plugin answers by publishing
 /// the window — a snapshot cycle regains the registry").
+///
+/// The refusal arm mirrors the store's own contract exactly ("a rejection
+/// leaves everything exactly as it was"): the model's revision claim is
+/// ROLLED BACK to the revision the leg still holds, the taken ack batch is
+/// restored (the acknowledgment only rode an applied frame), and the
+/// structured reject is recorded with the report's head — which RAISES the
+/// claim frontier above the store's truth (the realignment in
+/// [`DemoState::note_reject`]), so the next cycle's publish escapes the
+/// wedged lane instead of re-colliding with the store head forever.
 pub fn publish_widget_cycle(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
     // The successor claims the cadence FIRST (the revision law the next
     // publish must satisfy), then the model takes it.
     let successor = state.next_revision();
+    let prior_revision = state.widgets.as_ref().map(|surface| surface.revision);
     let Some(surface) = state.widgets.as_mut() else {
+        // The claim made no frame at all (nothing is published to cycle):
+        // roll it back so the claim ledger keeps matching real frames.
+        state.head -= 1;
         return false;
     };
     surface.revision = successor;
     let published = surface.clone();
+    let acks = std::mem::take(&mut state.pending_ack);
     state.sent += 1;
-    match host_wire::send_widget_publish(
-        sender,
-        PANEL_ID,
-        published,
-        std::mem::take(&mut state.pending_ack),
-    ) {
+    match host_wire::send_widget_publish(sender, PANEL_ID, published, acks.clone()) {
         host_wire::WireOutcome::Applied { revision, .. } => {
             let leg_head = state.widgets.as_ref().map(|surface| surface.revision);
             debug_assert_eq!(
@@ -350,14 +359,64 @@ pub fn publish_widget_cycle(sender: &Arc<dyn PluginRequestSender>, state: &mut D
                 "the cycle's successor is the model's new leg head"
             );
             state.applied += 1;
+            state.note_frame(
+                "widget publish",
+                None,
+                Some(successor.0),
+                FrameOutcome::Applied,
+            );
             true
         }
         host_wire::WireOutcome::Rejected { code, report } => {
-            state.rejected += 1;
-            state.last_reject = Some((code, report.current_revision));
+            // Zero mutation on the wire: the model never adopted the claim
+            // (the store's own contract, mirrored — this arm used to keep
+            // the claimed revision in the model, a model-vs-store
+            // divergence waiting for the next patch's base).
+            state.pending_ack = acks;
+            if let Some(prior) = prior_revision {
+                if let Some(surface) = state.widgets.as_mut() {
+                    surface.revision = prior;
+                }
+            }
+            state.note_reject(
+                "widget publish",
+                None,
+                Some(successor.0),
+                code,
+                report.current_revision,
+            );
             false
         }
-        _ => false,
+        host_wire::WireOutcome::Unserviceable(message) => {
+            state.pending_ack = acks;
+            if let Some(prior) = prior_revision {
+                if let Some(surface) = state.widgets.as_mut() {
+                    surface.revision = prior;
+                }
+            }
+            state.note_frame("widget publish", None, Some(successor.0), FrameOutcome::Unserviceable(message));
+            false
+        }
+        host_wire::WireOutcome::Failed(error) => {
+            state.pending_ack = acks;
+            if let Some(prior) = prior_revision {
+                if let Some(surface) = state.widgets.as_mut() {
+                    surface.revision = prior;
+                }
+            }
+            state.note_frame("widget publish", None, Some(successor.0), FrameOutcome::SendFailed(error));
+            false
+        }
+        host_wire::WireOutcome::Unexpected => {
+            state.pending_ack = acks;
+            if let Some(prior) = prior_revision {
+                if let Some(surface) = state.widgets.as_mut() {
+                    surface.revision = prior;
+                }
+            }
+            state.note_frame("widget publish", None, Some(successor.0), FrameOutcome::Unexpected);
+            false
+        }
     }
 }
 
@@ -458,7 +517,9 @@ fn extend_table_window(
 }
 
 /// The widgets demo: publish the surface, then drive ONE cell-level patch
-/// (the single-cell wire fact). Returns whether every frame applied.
+/// (the single-cell wire fact). Returns whether every frame applied. Every
+/// exchange records its [`FrameFact`]; a non-applied publish restores the
+/// taken ack batch (the acknowledgment only rode an applied frame).
 pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
     // (1) Snapshot leg of the widget surface (the publish that goes LIVE
     // on the host's mount).
@@ -466,24 +527,47 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
         Ok(surface) => surface,
         Err(_) => return false,
     };
+    let claimed = surface.revision.0;
+    let acks = std::mem::take(&mut state.pending_ack);
     state.sent += 1;
-    match host_wire::send_widget_publish(
-        sender,
-        PANEL_ID,
-        surface.clone(),
-        std::mem::take(&mut state.pending_ack),
-    ) {
+    match host_wire::send_widget_publish(sender, PANEL_ID, surface.clone(), acks.clone()) {
         host_wire::WireOutcome::Applied { revision, .. } => {
             debug_assert_eq!(revision, surface.revision);
             state.applied += 1;
+            state.note_frame(
+                "widget publish",
+                None,
+                Some(claimed),
+                FrameOutcome::Applied,
+            );
             state.widgets = Some(surface);
         }
         host_wire::WireOutcome::Rejected { code, report } => {
-            state.rejected += 1;
-            state.last_reject = Some((code, report.current_revision));
+            state.pending_ack = acks;
+            state.note_reject(
+                "widget publish",
+                None,
+                Some(claimed),
+                code,
+                report.current_revision,
+            );
             return false;
         }
-        _ => return false,
+        host_wire::WireOutcome::Unserviceable(message) => {
+            state.pending_ack = acks;
+            state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unserviceable(message));
+            return false;
+        }
+        host_wire::WireOutcome::Failed(error) => {
+            state.pending_ack = acks;
+            state.note_frame("widget publish", None, Some(claimed), FrameOutcome::SendFailed(error));
+            return false;
+        }
+        host_wire::WireOutcome::Unexpected => {
+            state.pending_ack = acks;
+            state.note_frame("widget publish", None, Some(claimed), FrameOutcome::Unexpected);
+            return false;
+        }
     }
 
     // (2) The one-cell patch: the `length` cell of row 305 — keyed, minimal.
@@ -492,6 +576,8 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
     };
     let successor = state.next_revision();
     let patch = cell_length_patch(base.0, successor.0, DEMO_PATCH_ROW_KEY, DEMO_PATCH_LENGTH);
+    let base_revision = patch.base_revision.0;
+    let claimed = patch.revision.0;
     state.sent += 1;
     match host_wire::send_widget_patch(sender, PANEL_ID, patch.clone()) {
         host_wire::WireOutcome::Applied { revision, .. } => {
@@ -500,16 +586,44 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
                 return false;
             };
             if applied.apply_patch(patch).is_err() {
+                state.note_frame(
+                    "widget patch",
+                    Some(base_revision),
+                    Some(claimed),
+                    FrameOutcome::AppliedModelLagged(revision.0),
+                );
                 return false;
             }
             debug_assert_eq!(applied.revision, revision, "model and host agree");
+            state.note_frame(
+                "widget patch",
+                Some(base_revision),
+                Some(claimed),
+                FrameOutcome::Applied,
+            );
         }
         host_wire::WireOutcome::Rejected { code, report } => {
-            state.rejected += 1;
-            state.last_reject = Some((code, report.current_revision));
+            state.note_reject(
+                "widget patch",
+                Some(base_revision),
+                Some(claimed),
+                code,
+                report.current_revision,
+            );
             return false;
         }
-        _ => return false,
+        host_wire::WireOutcome::Unserviceable(message) => {
+            state.note_frame("widget patch", Some(base_revision), Some(claimed), FrameOutcome::Unserviceable(message));
+            return false;
+        }
+        host_wire::WireOutcome::Failed(error) => {
+            state.note_frame("widget patch", Some(base_revision), Some(claimed), FrameOutcome::SendFailed(error));
+            return false;
+        }
+        host_wire::WireOutcome::Unexpected => {
+            state.note_frame("widget patch", Some(base_revision), Some(claimed), FrameOutcome::Unexpected);
+            return false;
+        }
     }
     true
 }
@@ -517,7 +631,7 @@ pub fn run_widgets_demo(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoS
 #[cfg(test)]
 mod tests {
     use ocs_plugin_api::host::{BuiltinPlugin, HostNotification};
-    use ocs_plugin_api::ipc::protocol::PanelStoreKind;
+    use ocs_plugin_api::ipc::protocol::{PanelStoreKind, PatchRejectCode};
     use ocs_plugin_api::scene::SceneRevision;
     use ocs_plugin_api::widgets::{WidgetCellValue, WidgetEvent, WidgetRange};
 
@@ -798,5 +912,75 @@ mod tests {
         let round: WidgetSurfacePatch =
             bincode::deserialize(&bincode::serialize(&patch).unwrap()).unwrap();
         assert_eq!(round, patch);
+    }
+
+    /// THE model-vs-store contract, mirrored plugin-side: a REFUSED
+    /// snapshot cycle leaves everything exactly as it was — the model's
+    /// revision claim rolls back to the leg the store STILL holds, the
+    /// taken ack batch is restored (the acknowledgment only rode an
+    /// applied frame), and the structured reject's report head raises the
+    /// claim frontier so the NEXT cycle escapes the wedged lane. The
+    /// wedge drive is the real lost-response shape: the plugin's claim
+    /// frontier rewound BELOW the leg the host holds.
+    #[test]
+    fn refused_widget_cycle_restores_model_ack_leg_and_realigns() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(super::run_widgets_demo(&sender, &mut state));
+        // The surface id both the events and the store address.
+        let surface_id = state.widgets_surface_id().expect("published");
+        assert_eq!(surface_id, StableId(ROOT_GROUP_ID));
+
+        // A merged event batch + a pending demand (the live-loop state).
+        state.handle_events(
+            surface_id,
+            vec![WidgetEvent::SelectionChanged {
+                surface_id,
+                selected_ids: vec![StableId(1)],
+            }],
+        );
+        state.on_store_demand(Some(StableId(TABLE_ID)), WidgetRange { start: 8, len: 8 });
+        assert_eq!(state.pending_ack.len(), 1);
+        assert_eq!(state.pending_deliveries.len(), 1);
+
+        // THE WEDGE: the claim frontier rewound below the held leg —
+        // exactly what a lost response (or a foreign-tab refusal) leaves
+        // behind when the plugin's tallies were the only witness.
+        state.head = 0;
+
+        // The cycle through the plugin's real deliver path (the demand
+        // answer's publish refuses — revision 1 ≤ the held head 2).
+        assert_eq!(deliver_pending(&sender, &mut state), 0);
+
+        // (a) the model never adopted the refused claim;
+        assert_eq!(
+            state.widgets.as_ref().expect("model kept").revision,
+            SceneRevision(2),
+            "the refused claim rolled back to the leg the store holds"
+        );
+        // (b) the ack batch is owed again (the publish that refused did
+        // not carry it);
+        assert_eq!(state.pending_ack.len(), 1, "the ack batch restored");
+        // (c) the report's head raised the frontier above the store's
+        // truth — the ONE-cadence law holds without rewinding a leg;
+        assert_eq!(state.head, 2, "realigned to the report's head");
+        assert_eq!(
+            state.last_reject,
+            Some((PatchRejectCode::NonMonotonicRevision, Some(SceneRevision(2))))
+        );
+        // (d) THE HEAL: the next demand's cycle publishes from the
+        // realigned frontier — one frame, applied, the store agrees.
+        state.on_store_demand(Some(StableId(TABLE_ID)), WidgetRange { start: 16, len: 8 });
+        assert_eq!(deliver_pending(&sender, &mut state), 1);
+        assert_eq!(state.head, 3);
+        let stored = host.widgets().expect("published").clone();
+        assert_eq!(stored.revision, SceneRevision(3));
+        assert_eq!(
+            stored.tables[&StableId(TABLE_ID)].rows.len(),
+            24,
+            "the window grew past the wedged lane"
+        );
     }
 }
