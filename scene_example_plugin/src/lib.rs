@@ -14,8 +14,8 @@
 //! producing its scene / widget-surface slices, its event handling, and
 //! an expected-observation note. All of them are registered in the ONE
 //! [`FEATURES`] table below; the ribbon groups, the command dispatch, the
-//! `SCN_HELP` index and the flow/refusal grammar are all DATA-DRIVEN off
-//! that table. Adding panel functionality
+//! `SCN_HELP` index, the MCP-parity address list and the flow/refusal
+//! grammar are all DATA-DRIVEN off that table. Adding panel functionality
 //! = write a module + add one registration line.
 //!
 //! The features:
@@ -39,12 +39,37 @@
 //!   `HostNotification::PanelSceneEvents` batches merge into plugin state
 //!   and queue the merge ACKNOWLEDGMENT that rides the next publish's
 //!   event leg (patch frames carry no events field); `SCN_DELIVER` flushes
-//!   queued demand answers; `SCN_DEBUG` dumps the wire tallies; `SCN_HELP`
-//!   prints the feature table.
-//!
-//! The showcase features (drag, menu+list, lazy tree pages, the GUI
-//! cell-edit loop, assets+theming, the owner law) register as they land —
-//! each one module + one table row.
+//!   queued demand answers; `SCN_DEBUG` dumps the wire tallies and the
+//!   MCP-parity address list; `SCN_HELP` prints the feature table.
+//! - **Drag demo** ([`mod@drag_demo`], `SCN_DEMO_DRAG`): a scene element
+//!   carrying [`DragMeta`](ocs_plugin_api::scene::DragMeta) — the host
+//!   runs Begin/host-local preview/Settle; the settle arrives as the
+//!   mount's `drag_settle` command event, the plugin resolves the
+//!   element's meta verbatim out of ITS OWN model (the wire never echoes
+//!   it) and moves the node AUTHORITATIVELY with exactly one patch; a
+//!   cancel is a lossless no-op (no event, nothing moves).
+//! - **Menu + List demo** ([`mod@menu_list`], `SCN_DEMO_MENU`): a Menu
+//!   (submenu + shortcut + one confirm-policy item) and an item List
+//!   patched onto the widgets surface; invocations and activations ride
+//!   the ordinary event stream.
+//! - **Lazy-children tree demo** ([`mod@tree_lazy`], `SCN_DEMO_TREE`):
+//!   an expandable branch with NO static children (`lazy_children=true`);
+//!   every `ChildrenRequested` ask is answered with the NEXT BOUNDED PAGE
+//!   (no duplicate fetch for satisfied windows).
+//! - **GUI cell-edit closed loop** ([`mod@cell_edit`],
+//!   `SCN_DEMO_CELLEDIT`): the host commits a cell edit (two-phase
+//!   pointer / keyboard), the plugin receives `TableCellChanged`,
+//!   validates it, applies it to its model and acks it with ONE cell
+//!   patch; an invalid value is refused with the model untouched.
+//! - **Asset + theming demo** ([`mod@asset_scene`], `SCN_DEMO_ASSET`):
+//!   one host-managed [`SceneElement::Asset`] plus a theme-token vs
+//!   fixed-[`Rgba8`](ocs_plugin_api::scene::Rgba8) swatch pair
+//!   (theme-following vs never-changing).
+//! - **Owner-law demo** ([`mod@owner_law`], `SCN_DEMO_OWNER`): a second
+//!   publisher's publish of the LIVE panel id is refused
+//!   `PublisherOwnedByOther` — structured, zero mutation (the headless
+//!   double mirrors the multi-plugin host verbatim; the demo never fights
+//!   the real host).
 //!
 //! See `PLUGIN-AUTHORING.md` beside this crate for the plugin-authoring
 //! recipe guide; every recipe references the module that embodies it.
@@ -67,8 +92,12 @@ mod scene_graph;
 mod state;
 mod widgets_table;
 
-// The showcase modules land with their own registrations (one line per
-// feature in the FEATURES table below).
+mod asset_scene;
+mod cell_edit;
+mod drag_demo;
+mod menu_list;
+mod owner_law;
+mod tree_lazy;
 
 // Keep these fields in sync with `plugin.toml` beside this package.
 static MANIFEST: PluginManifest = PluginManifest {
@@ -92,6 +121,12 @@ const CMD_DEMO_SCENE: &str = "SCN_DEMO_SCENE";
 const CMD_DEMO_WIDGETS: &str = "SCN_DEMO_WIDGETS";
 const CMD_DEMO_STALE: &str = "SCN_DEMO_STALE";
 const CMD_DELIVER: &str = "SCN_DELIVER";
+const CMD_DEMO_DRAG: &str = "SCN_DEMO_DRAG";
+const CMD_DEMO_MENU: &str = "SCN_DEMO_MENU";
+const CMD_DEMO_TREE: &str = "SCN_DEMO_TREE";
+const CMD_DEMO_CELLEDIT: &str = "SCN_DEMO_CELLEDIT";
+const CMD_DEMO_ASSET: &str = "SCN_DEMO_ASSET";
+const CMD_DEMO_OWNER: &str = "SCN_DEMO_OWNER";
 /// The diagnostic dump (dispatch-addressable AND ribbon-visible): one
 /// passive line of the demo's wire tallies, the MCP-parity address list
 /// and the recent interaction journal.
@@ -145,10 +180,8 @@ pub(crate) struct DemoFeature {
 
 /// THE one registration table. Adding panel functionality = write a
 /// module + add one line here; ribbon groups, dispatch, help and the MCP
-/// address list all follow. (The showcase modules — drag, menu+list,
-/// lazy tree pages, cell edits, assets+theming, owner law — register
-/// beside the module that embodies each.)
-static FEATURES: [DemoFeature; 4] = [
+/// address list all follow.
+static FEATURES: [DemoFeature; 10] = [
     DemoFeature {
         id: "graph_scene",
         flow_name: "Scene",
@@ -192,6 +225,76 @@ static FEATURES: [DemoFeature; 4] = [
         tail: FlowTail::Frame,
         run: deliver_only,
     },
+    DemoFeature {
+        id: "drag",
+        flow_name: "Drag",
+        commands: &[CMD_DEMO_DRAG],
+        observation: "the accent Drag card (drag meta scn-drag:node-1) is armed on the \
+                      scene; drag it IN THE HOST — a settle (run this command after the \
+                      gesture) moves it authoritatively with exactly ONE patch, while a \
+                      cancel moves nothing (cancel emits no event)",
+        ribbon: Some(("Showcase", "Drag demo", "\u{2725}", false)),
+        tail: FlowTail::Frame,
+        run: drag_demo::run_drag_demo,
+    },
+    DemoFeature {
+        id: "menu_list",
+        flow_name: "MenuList",
+        commands: &[CMD_DEMO_MENU],
+        observation: "the panel grows a Menu (submenu + shortcuts + one \
+                      ConfirmPolicy::Prompt item) and a List of four layer items; menu \
+                      invocations and item activations arrive as ordinary events",
+        ribbon: Some(("Showcase", "Menu + List", "\u{2630}", false)),
+        tail: FlowTail::Frame,
+        run: menu_list::run_menu_list_demo,
+    },
+    DemoFeature {
+        id: "tree_lazy",
+        flow_name: "TreeLazy",
+        commands: &[CMD_DEMO_TREE],
+        observation: "the tree gains the 'Sheets (lazy)' branch (no static children); \
+                      expanding it asks ChildrenRequested and every ask is answered with \
+                      the NEXT bounded 4-row page — satisfied windows are never \
+                      re-answered",
+        ribbon: Some(("Showcase", "Lazy tree page", "\u{2503}", false)),
+        tail: FlowTail::Frame,
+        run: tree_lazy::run_tree_lazy_demo,
+    },
+    DemoFeature {
+        id: "cell_edit",
+        flow_name: "CellEdit",
+        commands: &[CMD_DEMO_CELLEDIT],
+        observation: "THE closed loop: a host-side cell edit (two-phase click or keyboard) \
+                      arrives as TableCellChanged, the plugin validates it against its \
+                      model, applies it and acks with ONE cell patch — a negative length \
+                      is refused with the model untouched",
+        ribbon: Some(("Showcase", "Cell edit loop", "\u{270E}", false)),
+        tail: FlowTail::Frame,
+        run: cell_edit::run_cell_edit_demo,
+    },
+    DemoFeature {
+        id: "asset_theme",
+        flow_name: "AssetTheme",
+        commands: &[CMD_DEMO_ASSET],
+        observation: "the scene gains a host-managed SVG asset (an opaque AssetRef — no \
+                      bytes on the wire) and a swatch pair: the theme-token swatch \
+                      follows the host theme, the fixed-RGBA swatch never changes",
+        ribbon: Some(("Showcase", "Asset + theme", "\u{25E8}", false)),
+        tail: FlowTail::Frame,
+        run: asset_scene::run_asset_theme_demo,
+    },
+    DemoFeature {
+        id: "owner_law",
+        flow_name: "Owner",
+        commands: &[CMD_DEMO_OWNER],
+        observation: "a second publisher's publish of the LIVE panel id is refused \
+                      PublisherOwnedByOther — structured, zero mutation; the headless \
+                      double mirrors the multi-plugin host verbatim (this plugin never \
+                      fights the real host)",
+        ribbon: Some(("Showcase", "Owner law", "\u{2298}", false)),
+        tail: FlowTail::Frame,
+        run: owner_law::run_owner_probe,
+    },
 ];
 
 /// The refusal-report/flow handle: a borrow of ONE [`FEATURES`] row. The
@@ -230,6 +333,40 @@ impl Flow {
     pub(crate) fn deliver() -> Self {
         Flow(&FEATURES[3])
     }
+    #[cfg(test)]
+    pub(crate) fn drag() -> Self {
+        Flow(&FEATURES[4])
+    }
+    #[cfg(test)]
+    pub(crate) fn menu_list() -> Self {
+        Flow(&FEATURES[5])
+    }
+    #[cfg(test)]
+    pub(crate) fn tree_lazy() -> Self {
+        Flow(&FEATURES[6])
+    }
+    #[cfg(test)]
+    pub(crate) fn cell_edit() -> Self {
+        Flow(&FEATURES[7])
+    }
+    #[cfg(test)]
+    pub(crate) fn asset_theme() -> Self {
+        Flow(&FEATURES[8])
+    }
+    #[cfg(test)]
+    pub(crate) fn owner() -> Self {
+        Flow(&FEATURES[9])
+    }
+}
+
+/// The demo's dispatch-addressable command strings (the [`FEATURES`]
+/// table's rows, in registration order) — the MCP-parity address list
+/// quotes them.
+pub(crate) fn feature_commands() -> Vec<&'static str> {
+    FEATURES
+        .iter()
+        .flat_map(|feature| feature.commands.iter().copied())
+        .collect()
 }
 
 /// The feature a command dispatches to (`None` = not ours — the host's
@@ -969,5 +1106,70 @@ mod tests {
         assert!(feature_for_command(CMD_DEBUG).is_none(), "state-only");
         assert!(feature_for_command(CMD_HELP).is_none(), "state-only");
         assert!(feature_for_command(CMD_OPEN).is_none(), "panel arm");
+    }
+
+    /// THE FULL SHOWCASE on ONE cadence: every registered feature's flow
+    /// runs headless against the wire double, in table order, and every
+    /// frame applies — the one-panel-one-revision-cadence law holds across
+    /// all of them, and the ribbon/help/dispatch surfaces all name the
+    /// same rows.
+    #[test]
+    fn all_features_headless_on_one_cadence() {
+        let host = std::sync::Arc::new(FakeWireHost::new());
+        let sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        for feature in FEATURES.iter() {
+            let head_before = state.head;
+            assert!(
+                (feature.run)(&sender, &mut state),
+                "feature {} applies headless",
+                feature.id
+            );
+            assert!(
+                state.head > head_before || state.head == head_before,
+                "the cadence never rewinds ({})",
+                feature.id
+            );
+        }
+        // Both legs live; the heads agree with the host's store.
+        assert!(state.scene.is_some());
+        assert!(state.widgets.is_some());
+        assert_eq!(state.widgets_head(), host.widgets().map(|surface| surface.revision));
+        // The cadence head covers both legs (one panel, one cadence).
+        assert!(state.head >= state.scene_head().expect("scene leg").0);
+        assert!(state.head >= state.widgets_head().expect("widget leg").0);
+        // The help index names every feature (the table IS the doc).
+        let help = features_help();
+        for feature in FEATURES.iter() {
+            assert!(help.contains(feature.id), "help names {}: {help}", feature.id);
+        }
+    }
+
+    /// The MCP-parity observable: the debug dump lists the ADDRESSES an
+    /// MCP client would use — `panel_semantics` / `panel_page` /
+    /// `panel_widget_invoke` address the very surfaces this plugin
+    /// publishes (one host path; the plugin ships no MCP code).
+    #[test]
+    fn debug_report_lists_mcp_addresses() {
+        let host = std::sync::Arc::new(FakeWireHost::new());
+        let sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(scene_graph::run_scene_demo(&sender, &mut state));
+        assert!(widgets_table::run_widgets_demo(&sender, &mut state));
+
+        let dump = state.debug_report();
+        for address in [
+            "panel_semantics(panel \"scn_panel\", surface 90)",
+            "tree 100",
+            "table 200, cols 201..=204, keys 300..=339 total 40",
+            "panel_page(",
+            "panel_widget_invoke(commands",
+            "scn_delete_node",
+            "drag_settle",
+        ] {
+            assert!(dump.contains(address), "the dump names {address}: {dump}");
+        }
     }
 }

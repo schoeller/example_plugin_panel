@@ -12,7 +12,7 @@
 id = "schoeller.scene_example"
 name = "Scene Example"
 version = "0.4.0"
-description = "Reference API v24 add-on: a scene-on-a-panel demo (graph cards, typed tables, stale-base recovery)."
+description = "Reference API v24 add-on: the full scene-UI showcase (graph scenes, typed tables, drag, menus, lazy trees, cell edits, assets, owner law) and its own authoring guide."
 author = "Sebastian Schoeller"
 license = "GPL-3.0-only"
 repository = "schoeller/example_plugin_panel"
