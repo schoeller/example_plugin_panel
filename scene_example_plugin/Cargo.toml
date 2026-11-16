@@ -21,7 +21,7 @@ crate-type = ["cdylib"]
 # API major comes from the same crate the host builds against: this checkout
 # is at the API-24 tip, so the compiled cdylib reports v24 and can decode the
 # v24 scene/widget wire.
-ocs_plugin_api = { path = "../OpenCADStudio/crates/ocs_plugin_api", features = ["host"] }
+ocs_plugin_api = { path = "../../OpenCADStudio/crates/ocs_plugin_api", features = ["host"] }
 
 [dev-dependencies]
 # Test-only: the wire serializer (the same 1.3.x line the api crate's own
