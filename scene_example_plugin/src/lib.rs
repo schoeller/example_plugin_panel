@@ -69,6 +69,11 @@ const CMD_DEMO_SCENE: &str = "SCN_DEMO_SCENE";
 const CMD_DEMO_WIDGETS: &str = "SCN_DEMO_WIDGETS";
 const CMD_DEMO_STALE: &str = "SCN_DEMO_STALE";
 const CMD_DELIVER: &str = "SCN_DELIVER";
+/// The diagnostic dump (dispatch-addressable AND ribbon-visible): one
+/// passive line of the demo's wire tallies — sent/applied/rejected, both
+/// legs' heads, the pending queues, the latest recorded rejection and the
+/// latest frame's exchange outcome.
+const CMD_DEBUG: &str = "SCN_DEBUG";
 
 /// Static panel definition: the v24 surfaces MOUNT on a registered panel —
 /// the publish frames name the panel id the registration used (ownership
@@ -81,7 +86,7 @@ fn demo_panel() -> PanelDef {
         .with_control(DialogControl::InfoText {
             text: "API v24 scene demo: SCN_DEMO_SCENE builds the graph scene, \
                    SCN_DEMO_WIDGETS the typed-table surface, SCN_DEMO_STALE runs \
-                   the conflict/recovery loop."
+                   the conflict/recovery loop, SCN_DEBUG dumps the wire tallies."
                 .into(),
             align_h: Some(HorizontalAlign::Left),
         })
@@ -123,6 +128,12 @@ impl CadModule for SceneModule {
                         icon: IconKind::Glyph("▦"),
                         event: ModuleEvent::Command(CMD_DEMO_WIDGETS.to_string()),
                     }),
+                    RibbonItem::LabeledTool(ToolDef {
+                        id: CMD_DEBUG,
+                        label: "Debug dump",
+                        icon: IconKind::Glyph("Ω"),
+                        event: ModuleEvent::Command(CMD_DEBUG.to_string()),
+                    }),
                 ],
             }]
         })
@@ -138,9 +149,88 @@ enum Flow {
     Deliver,
 }
 
+impl Flow {
+    /// The flow name the refusal report quotes (the printout's WHO).
+    fn name(&self) -> &'static str {
+        match self {
+            Flow::Scene => "Scene",
+            Flow::Widgets => "Widgets",
+            Flow::Stale => "Stale",
+            Flow::Deliver => "Deliver",
+        }
+    }
+}
+
+/// The refusal report — SELF-EXPLAINING: which flow refused, the
+/// structured `PatchRejectCode` with the report's head and the frame's
+/// base when a coded reject reached the plugin, or the exact codeless
+/// cause when the answer named NO code (a transport failure, or the wire's
+/// plain `Error` — on the live host the V4 nested-serving guard's text,
+/// carried verbatim so the user's own log names the real cause). The
+/// material is THIS run's frame record (`begin_flow` cleared it; the send
+/// sites re-recorded), never a stale one.
+fn refused_report(state: &state::DemoState, flow: &Flow) -> String {
+    let cause = match &state.last_frame {
+        None => "the flow stopped at its own gates — no frame reached the wire".to_string(),
+        Some(fact) => match &fact.outcome {
+            state::FrameOutcome::Rejected(code, head) => {
+                let head_text = head
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let base_text = fact
+                    .base
+                    .map(|base| base.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                format!("{code:?}; host head {}; frame base {}", head_text, base_text)
+            }
+            state::FrameOutcome::AppliedModelLagged(revision) => format!(
+                "the frame applied on the wire (host head {}) but the plugin's \
+                 model mirror refused — the model lags the host; the next full \
+                 publish realigns it",
+                revision
+            ),
+            state::FrameOutcome::Applied => format!(
+                "the flow stopped locally after the {} answered (no host rejection)",
+                fact.leg
+            ),
+            state::FrameOutcome::SendFailed(note) => format!(
+                "no code named — the request line answered a transport error: {}",
+                note
+            ),
+            state::FrameOutcome::Unserviceable(note) => format!(
+                "no code named — the wire answered `Error`, not a structured \
+                 reject: {}",
+                note
+            ),
+            state::FrameOutcome::Unexpected => {
+                "no code named — the wire's answer decoded as neither an ack \
+                 nor a structured reject"
+                    .to_string()
+            }
+        },
+    };
+    // The flow-specific tail: the stale flow's `recovered` fact (the
+    // refused arm's recovery never completed); the scene/widget flows name
+    // the frame the answer came from (its claimed revision when one was
+    // claimed).
+    let flow_tail = match flow {
+        Flow::Stale => "; recovered=false".to_string(),
+        _ => match &state.last_frame {
+            Some(fact) => match fact.next {
+                Some(next) => format!("; frame = {} (next {})", fact.leg, next),
+                None => format!("; frame = {} (no revision claimed)", fact.leg),
+            },
+            None => String::new(),
+        },
+    };
+    format!("Scene Example: Flow::{} refused ({}){}", flow.name(), cause, flow_tail)
+}
+
 /// One demo command's shape: flush the queued demand answers first (the
 /// answers are publishes), then run the command's own flow, and report
-/// what the wire did.
+/// what the wire did — the applied arm keeps its tally awareness; the
+/// refused arm names the flow, the reject code, the report's head and the
+/// frame's base/claimed revision (or the exact codeless cause).
 fn run_command(
     sender: &Option<Arc<dyn PluginRequestSender>>,
     state: &mut state::DemoState,
@@ -149,6 +239,9 @@ fn run_command(
     let Some(sender) = sender else {
         return "Scene Example: no host request line — nothing sent.".to_string();
     };
+    // The per-run frame record clears: a refusal print names THIS run's
+    // exchange, never a previous one's.
+    state.begin_flow();
     let delivered = match state.widgets.is_some() {
         true => widgets_table::deliver_pending(sender, state),
         false => 0,
@@ -164,8 +257,15 @@ fn run_command(
         n => format!("; {n} queued page deliver"),
     };
     match applied {
-        true => format!("Scene Example: flow applied{delivered_note}"),
-        false => format!("Scene Example: the flow was refused{delivered_note}"),
+        true => format!(
+            "Scene Example: flow applied{} (sent {}, applied {}, rejected {})",
+            delivered_note, state.sent, state.applied, state.rejected
+        ),
+        false => format!(
+            "{}{}",
+            refused_report(state, &flow),
+            delivered_note
+        ),
     }
 }
 
@@ -264,6 +364,13 @@ impl BuiltinPlugin for SceneExamplePlugin {
                 host.push_info(&info);
                 true
             }
+            // The diagnostic dump: state-only, sender-free — one passive
+            // line of the tallies the refusal reports quote.
+            CMD_DEBUG => {
+                let info = self.state().debug_report();
+                host.push_info(&info);
+                true
+            }
             _ => false,
         }
     }
@@ -318,7 +425,8 @@ ocs_plugin_api::export_plugin!(SceneExamplePlugin::new());
 
 #[cfg(test)]
 mod tests {
-    use ocs_plugin_api::host::{HostNotification, PluginRequestSender};
+    use ocs_plugin_api::host::{HostNotification, PluginRequestError, PluginRequestSender};
+    use ocs_plugin_api::ipc::protocol::{PluginRequest, PluginResponse};
     use ocs_plugin_api::manifest::API_VERSION;
     use ocs_plugin_api::scene::{SceneRevision, StableId};
     use ocs_plugin_api::widgets::{WidgetEvent, WidgetRange};
@@ -327,6 +435,36 @@ mod tests {
     use crate::state::DemoState;
 
     use super::*;
+
+    /// The scripted-request-line double: every frame gets the SAME
+    /// scripted answer. The two codeless answer shapes the live host can
+    /// produce (the wire's plain `Error` text — the V4 nested-serving
+    /// guard's refusal — and a transport-level failure) drive the
+    /// no-code-named refusal reports through the plugin's real send paths.
+    struct Scripted {
+        answer: ScriptedAnswer,
+    }
+
+    enum ScriptedAnswer {
+        /// The wire's plain `Error` (a codeless refusal).
+        Error(String),
+        /// The request line itself failed (no answer exists).
+        Transport(String),
+    }
+
+    impl PluginRequestSender for Scripted {
+        fn request(
+            &self,
+            _req: PluginRequest,
+        ) -> Result<PluginResponse, PluginRequestError> {
+            match &self.answer {
+                ScriptedAnswer::Error(message) => {
+                    Ok(PluginResponse::Error(message.clone()))
+                }
+                ScriptedAnswer::Transport(message) => Err(PluginRequestError(message.clone())),
+            }
+        }
+    }
 
     /// Minimal two-section TOML reader (the manifest pins itself without a
     /// toml dependency).
@@ -522,5 +660,115 @@ mod tests {
         // construction.
         assert!(state.head >= state.scene_head().expect("scene leg").0);
         assert!(state.head >= state.widgets_head().expect("widget leg").0);
+    }
+
+    /// THE refusal report's coded shape, byte-exact against the user's
+    /// log grammar: WHICH flow, the `PatchRejectCode`, the report's
+    /// current head, the frame's base — and the stale flow's recovery
+    /// fact. The record is exactly what `run_stale_conflict`'s refuse
+    /// path leaves (base 11, claimed successor 12, the report naming
+    /// head 12).
+    #[test]
+    fn refusal_report_names_flow_code_heads_and_frame() {
+        let mut state = DemoState::default();
+        state.note_reject(
+            "scene patch",
+            Some(11),
+            Some(12),
+            ocs_plugin_api::ipc::protocol::PatchRejectCode::StaleBase,
+            Some(ocs_plugin_api::scene::SceneRevision(12)),
+        );
+        assert_eq!(
+            refused_report(&state, &Flow::Stale),
+            "Scene Example: Flow::Stale refused (StaleBase; host head 12; frame base 11); \
+             recovered=false"
+        );
+        // The scene flow's twin of the same refusal names the frame leg
+        // and the claimed revision instead of the recovery fact.
+        assert_eq!(
+            refused_report(&state, &Flow::Scene),
+            "Scene Example: Flow::Scene refused (StaleBase; host head 12; frame base 11); \
+             frame = scene patch (next 12)"
+        );
+    }
+
+    /// The CODELESS refusal shape — the user's live ×2 signature: an
+    /// answer that names no reject code. The live host's two producers
+    /// (the wire's plain `Error` text — on the V4 transport, the
+    /// nested-serving tab guard — and a transport failure) print their own
+    /// text verbatim, never a guess, and leave the structured
+    /// `last_reject` untouched (exactly the silent recorded-lag symptom
+    /// the old generic line hid).
+    #[test]
+    fn codeless_refusals_print_the_wire_note_verbatim() {
+        let guard_note = "nested plugin request for tab 2 cannot be served \
+                          inline while the host dispatches on tab 1; send it \
+                          again after that dispatch returns"
+            .to_string();
+        let sender: std::sync::Arc<dyn PluginRequestSender> = std::sync::Arc::new(Scripted {
+            answer: ScriptedAnswer::Error(guard_note.clone()),
+        });
+        let mut state = DemoState::default();
+        let report = run_command(&Some(sender), &mut state, Flow::Scene);
+        assert_eq!(
+            report,
+            format!(
+                "Scene Example: Flow::Scene refused (no code named — the wire \
+                 answered `Error`, not a structured reject: {guard_note}); \
+                 frame = scene publish (next 1)"
+            )
+        );
+        assert_eq!(state.unserved_answers, 1);
+        assert_eq!(state.send_failures, 0);
+        assert_eq!(state.last_reject, None, "no coded reject ever reached us");
+
+        // The transport-failure twin: the request line itself answered an
+        // error (no answer exists for the frame). The stale flow's own
+        // gates need the model's scene leg first (headless seed — the
+        // wire is down anyway).
+        let sender: std::sync::Arc<dyn PluginRequestSender> = std::sync::Arc::new(Scripted {
+            answer: ScriptedAnswer::Transport("V4 reader thread disconnected".to_string()),
+        });
+        let mut state = DemoState::default();
+        state.scene = Some(crate::scene_graph::demo_graph_scene(4).unwrap());
+        let report = run_command(&Some(sender), &mut state, Flow::Stale);
+        assert_eq!(
+            report,
+            "Scene Example: Flow::Stale refused (no code named — the request \
+             line answered a transport error: V4 reader thread \
+             disconnected); recovered=false"
+                .to_string()
+        );
+        assert_eq!(state.send_failures, 1);
+        assert_eq!(state.last_reject, None);
+    }
+
+    /// The APPLIED arm keeps its tally awareness: the flow phrase, the
+    /// delivered-note slot, and the wire counts in one line.
+    #[test]
+    fn applied_report_keeps_tally_awareness() {
+        let host = std::sync::Arc::new(FakeWireHost::new());
+        let sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        let report = run_command(&Some(sender), &mut state, Flow::Scene);
+        assert_eq!(
+            report,
+            "Scene Example: flow applied (sent 4, applied 4, rejected 0)"
+        );
+
+        // The diagnostic dump (SCN_DEBUG's printout): the same tallies,
+        // both legs' heads, the pending queues and the run's frame record.
+        let dump = state.debug_report();
+        assert!(
+            dump.contains("sent 4, applied 4, rejected 0, stale rejected 0, recovered 0"),
+            "the dump's tallies: {dump}"
+        );
+        assert!(dump.contains("head 4 | scene head 4, widget head —"), "{dump}");
+        assert!(dump.contains("pending ack 0, pending deliver 0"), "{dump}");
+        assert!(
+            dump.contains("last reject: None | last frame: Some(FrameFact { leg: \"scene patch\", base: Some(3), next: Some(4), outcome: Applied })"),
+            "the dump's last frame: {dump}"
+        );
     }
 }

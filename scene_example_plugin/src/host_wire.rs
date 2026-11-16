@@ -27,9 +27,14 @@ use ocs_plugin_api::ipc::protocol::PanelStoreKind;
 use ocs_plugin_api::widgets::WidgetRange;
 
 /// Decoded answer of one v24 mutating frame (`PanelScenePublish` /
-/// `PanelScenePatch`): the typed ack, the structured rejection, or a wire
-/// failure. The `Unknown` passthrough of a future major decodes as
-/// [`WireOutcome::Unexpected`] — an honest never-pretend-success shape.
+/// `PanelScenePatch`): the typed ack, the structured rejection, a wire
+/// failure, or a codeless answer. The `Error` text a live host can answer
+/// with (on the V4 transport: the nested-serving guard's "nested plugin
+/// request for tab … cannot be served inline while the host dispatches to
+/// tab …") decodes as [`WireOutcome::Unserviceable`] — the refusal that
+/// NAMES NO CODE, print verbatim; the `Unknown` passthrough of a future
+/// major decodes as [`WireOutcome::Unexpected`] — an honest
+/// never-pretend-success shape.
 #[derive(Debug, PartialEq)]
 pub enum WireOutcome {
     /// `PatchApplied(AppliedPatchReport)` — the successor revision the host
@@ -46,13 +51,18 @@ pub enum WireOutcome {
         code: PatchRejectCode,
         report: PatchRejectReport,
     },
-    /// The send itself failed (no request line, or an error result).
-    Failed,
+    /// A decode that NAMEs no code: `PluginResponse::Error(String)` — the
+    /// wire's plain error text, carried verbatim (the codeless-refusal
+    /// class the diagnostic printout exists to name).
+    Unserviceable(String),
+    /// The send itself failed (no request line, or a transport error) —
+    /// the error's text, verbatim: no answer exists for this frame, so no
+    /// code can be named (the diagnostic print quotes the transport).
+    Failed(String),
     /// A decodable answer that is not a v24 patch ack (`Ok`, labels, …):
     /// never treated as success.
     Unexpected,
 }
-
 /// One bounded store window (`StorePage`): the rows plus the host's held
 /// count (`total_hint`; a table's self-declared total when its def names
 /// one).
@@ -71,6 +81,7 @@ fn decode_mutating(response: PluginResponse) -> WireOutcome {
             touched: report.touched_subtree_ids,
         },
         PluginResponse::PatchRejected { code, report } => WireOutcome::Rejected { code, report },
+        PluginResponse::Error(message) => WireOutcome::Unserviceable(message),
         _ => WireOutcome::Unexpected,
     }
 }
@@ -84,13 +95,14 @@ pub fn send_scene_publish(
     scene: PanelScene,
     events: Vec<WidgetEvent>,
 ) -> WireOutcome {
-    sender
-        .request(PluginRequest::PanelScenePublish {
-            panel_id: panel_id.to_owned(),
-            surface: SceneOrWidgetSurface::Scene(scene),
-            events,
-        })
-        .map_or(WireOutcome::Failed, decode_mutating)
+    match sender.request(PluginRequest::PanelScenePublish {
+        panel_id: panel_id.to_owned(),
+        surface: SceneOrWidgetSurface::Scene(scene),
+        events,
+    }) {
+        Ok(response) => decode_mutating(response),
+        Err(error) => WireOutcome::Failed(error.0),
+    }
 }
 
 /// Send the snapshot leg for a `WidgetSurface` (its publish also goes LIVE
@@ -101,13 +113,14 @@ pub fn send_widget_publish(
     surface: WidgetSurface,
     events: Vec<WidgetEvent>,
 ) -> WireOutcome {
-    sender
-        .request(PluginRequest::PanelScenePublish {
-            panel_id: panel_id.to_owned(),
-            surface: SceneOrWidgetSurface::Widgets(surface),
-            events,
-        })
-        .map_or(WireOutcome::Failed, decode_mutating)
+    match sender.request(PluginRequest::PanelScenePublish {
+        panel_id: panel_id.to_owned(),
+        surface: SceneOrWidgetSurface::Widgets(surface),
+        events,
+    }) {
+        Ok(response) => decode_mutating(response),
+        Err(error) => WireOutcome::Failed(error.0),
+    }
 }
 
 /// Send the incremental scene leg (`PanelScenePatch` / `SceneOrWidgetPatch::Scene`).
@@ -116,12 +129,13 @@ pub fn send_scene_patch(
     panel_id: &str,
     patch: PanelScenePatch,
 ) -> WireOutcome {
-    sender
-        .request(PluginRequest::PanelScenePatch {
-            panel_id: panel_id.to_owned(),
-            patch: SceneOrWidgetPatch::Scene(patch),
-        })
-        .map_or(WireOutcome::Failed, decode_mutating)
+    match sender.request(PluginRequest::PanelScenePatch {
+        panel_id: panel_id.to_owned(),
+        patch: SceneOrWidgetPatch::Scene(patch),
+    }) {
+        Ok(response) => decode_mutating(response),
+        Err(error) => WireOutcome::Failed(error.0),
+    }
 }
 
 /// Send the incremental widget leg (`PanelScenePatch` / `SceneOrWidgetPatch::Widgets`).
@@ -130,12 +144,13 @@ pub fn send_widget_patch(
     panel_id: &str,
     patch: WidgetSurfacePatch,
 ) -> WireOutcome {
-    sender
-        .request(PluginRequest::PanelScenePatch {
-            panel_id: panel_id.to_owned(),
-            patch: SceneOrWidgetPatch::Widgets(patch),
-        })
-        .map_or(WireOutcome::Failed, decode_mutating)
+    match sender.request(PluginRequest::PanelScenePatch {
+        panel_id: panel_id.to_owned(),
+        patch: SceneOrWidgetPatch::Widgets(patch),
+    }) {
+        Ok(response) => decode_mutating(response),
+        Err(error) => WireOutcome::Failed(error.0),
+    }
 }
 
 /// One windowed store read (`PanelStoreRead` → `StorePage`). The live demo

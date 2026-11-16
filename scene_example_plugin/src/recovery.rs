@@ -30,7 +30,7 @@ use ocs_plugin_api::scene_builder::PatchBuilder;
 
 use crate::host_wire::{self, WireOutcome};
 use crate::scene_graph::{PANEL_ID, RECOVERED_LABEL};
-use crate::state::DemoState;
+use crate::state::{DemoState, FrameOutcome};
 
 /// The label content the STALE write tried to install (the demo's marker
 /// for "this text never reached the host").
@@ -89,6 +89,10 @@ fn with_content(element: &SceneElement, content: &str) -> Option<SceneElement> {
 }
 
 /// The whole conflict→recovery loop. Returns whether the re-patch applied.
+/// Every exchange records its [`FrameFact`] (the stale send's structured
+/// `StaleBase` is the DEMO'S EXPECTED refusal — the report's head feeds the
+/// realignment in `note_reject`, so a wedged claim lane escapes on the
+/// recovery's own re-patch).
 pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> bool {
     // (1) The stale send: built against a base we KNOW the host has moved
     // past in this demo (the honest stand-in for a lost/replayed frame).
@@ -98,6 +102,8 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
     let Ok(stale) = stale_patch(head) else {
         return false;
     };
+    let base_revision = stale.base_revision.0;
+    let claimed = stale.revision.0;
     state.sent += 1;
     let reported_head: Option<SceneRevision>;
     match host_wire::send_scene_patch(sender, PANEL_ID, stale) {
@@ -105,14 +111,52 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
             code: PatchRejectCode::StaleBase,
             report,
         } => {
-            state.rejected += 1;
             state.stale_rejections += 1;
-            state.last_reject = Some((PatchRejectCode::StaleBase, report.current_revision));
             reported_head = report.current_revision;
+            state.note_reject(
+                "scene patch",
+                Some(base_revision),
+                Some(claimed),
+                PatchRejectCode::StaleBase,
+                report.current_revision,
+            );
+        }
+        // A DIFFERENT coded reject breaks the demo's premise exactly the
+        // same way (the stale shape was refused, just by another law);
+        // record it — the report names which law answered.
+        WireOutcome::Rejected { code, report } => {
+            state.note_reject(
+                "scene patch",
+                Some(base_revision),
+                Some(claimed),
+                code,
+                report.current_revision,
+            );
+            return false;
         }
         // Anything else breaks the demo's premise (an applied stale patch
         // would be a wire defect worth noticing loudly).
-        _ => return false,
+        WireOutcome::Applied { revision, .. } => {
+            state.note_frame(
+                "scene patch",
+                Some(base_revision),
+                Some(claimed),
+                FrameOutcome::AppliedModelLagged(revision.0),
+            );
+            return false;
+        }
+        WireOutcome::Unserviceable(message) => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unserviceable(message));
+            return false;
+        }
+        WireOutcome::Failed(error) => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::SendFailed(error));
+            return false;
+        }
+        WireOutcome::Unexpected => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unexpected);
+            return false;
+        }
     }
 
     // (2) The recovery read: the bounded snapshot (digest + leading
@@ -120,14 +164,26 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
     // head the rejection report named (both are the host's head; a
     // disagreement never blocks the recovery — the digest is the base
     // either way).
-    let Some((digest, window)) = host_wire::send_scene_snapshot2(sender, PANEL_ID) else {
+    let snapshot = host_wire::send_scene_snapshot2(sender, PANEL_ID);
+    state.sent += 1;
+    let Some((digest, window)) = snapshot else {
+        state.note_frame(
+            "snapshot2",
+            None,
+            None,
+            FrameOutcome::SendFailed("the snapshot2 page answered nothing usable".to_owned()),
+        );
         return false;
     };
-    state.sent += 1;
     let Some(scene_digest) = digest.scene else {
+        state.note_frame("snapshot2", None, None, FrameOutcome::Unexpected);
         return false;
     };
     let _same_head = reported_head == Some(scene_digest.revision);
+    // A read claims no revision — its fact is the digest's head alone; the
+    // record carries the leg so the report can quote a local stop after a
+    // served read ("the target was not in the window").
+    state.note_frame("snapshot2", None, None, FrameOutcome::Applied);
 
     // (3) Patch what the SNAPSHOT holds: locate the target label's live
     // element in the leading window, then write the recovered content.
@@ -144,6 +200,8 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
     else {
         return false;
     };
+    let base_revision = rebuilt.base_revision.0;
+    let claimed = rebuilt.revision.0;
     state.sent += 1;
     match host_wire::send_scene_patch(sender, PANEL_ID, rebuilt.clone()) {
         WireOutcome::Applied { revision, .. } => {
@@ -153,17 +211,45 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
                 return false;
             };
             if scene.apply_patch(rebuilt).is_err() {
+                state.note_frame(
+                    "scene patch",
+                    Some(base_revision),
+                    Some(claimed),
+                    FrameOutcome::AppliedModelLagged(revision.0),
+                );
                 return false;
             }
             debug_assert_eq!(scene.revision, revision, "model and host agree");
+            state.note_frame(
+                "scene patch",
+                Some(base_revision),
+                Some(claimed),
+                FrameOutcome::Applied,
+            );
             true
         }
         WireOutcome::Rejected { code, report } => {
-            state.rejected += 1;
-            state.last_reject = Some((code, report.current_revision));
+            state.note_reject(
+                "scene patch",
+                Some(base_revision),
+                Some(claimed),
+                code,
+                report.current_revision,
+            );
             false
         }
-        _ => false,
+        WireOutcome::Unserviceable(message) => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unserviceable(message));
+            false
+        }
+        WireOutcome::Failed(error) => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::SendFailed(error));
+            false
+        }
+        WireOutcome::Unexpected => {
+            state.note_frame("scene patch", Some(base_revision), Some(claimed), FrameOutcome::Unexpected);
+            false
+        }
     }
 }
 
@@ -296,5 +382,33 @@ mod tests {
             panic!("the window carries the label");
         };
         assert_eq!(content, RECOVERED_LABEL);
+    }
+
+    /// A WEDGED claim lane (the frontier rewound below the host-held leg
+    /// — the lost-response shape) recovers THROUGH the report's head: the
+    /// stale send still refuses (the demo's premise), the recorded report
+    /// realigns the frontier to the scene leg's truth, and the recovery's
+    /// re-patch builds from the digest revision at a strictly greater
+    /// successor — one frame, applied. Without the realignment the
+    /// rebuilt patch would be unbuildable (the successor would land at or
+    /// below the digest base) and the demo would refuse forever.
+    #[test]
+    fn wedged_claim_lane_recovers_through_the_reported_head() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(crate::scene_graph::run_scene_demo(&sender, &mut state));
+
+        // THE WEDGE: the frontier below the held scene leg.
+        state.head = 2;
+        assert!(run_stale_conflict(&sender, &mut state));
+        assert_eq!(state.recoveries, 1);
+        assert_eq!(
+            state.head, 5,
+            "the report's head realigned the frontier; the recovery claimed one above it"
+        );
+        assert_eq!(host.scene_head(), Some(SceneRevision(5)));
+        assert_eq!(state.scene.as_ref().expect("model kept").revision, SceneRevision(5));
     }
 }
