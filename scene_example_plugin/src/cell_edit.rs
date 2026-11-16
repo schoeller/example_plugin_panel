@@ -268,8 +268,7 @@ pub fn run_cell_edit_demo(
 
 #[cfg(test)]
 mod tests {
-    use ocs_plugin_api::host::PluginRequestError;
-    use ocs_plugin_api::ipc::protocol::{PatchRejectCode, PluginRequest, PluginResponse};
+    use ocs_plugin_api::ipc::protocol::PatchRejectCode;
     use ocs_plugin_api::widgets::{TableCell, WidgetEvent};
 
     use crate::fake_host::FakeWireHost;
@@ -277,27 +276,6 @@ mod tests {
     use crate::widgets_table::{COL_ITEM, COL_LENGTH, COL_LOCKED, COL_STATE};
 
     use super::*;
-
-    /// The scripted coded-reject double (every mutating frame refused
-    /// `StaleBase` naming `head`).
-    struct CodedReject {
-        head: u64,
-    }
-
-    impl PluginRequestSender for CodedReject {
-        fn request(
-            &self,
-            _req: PluginRequest,
-        ) -> Result<PluginResponse, PluginRequestError> {
-            Ok(PluginResponse::PatchRejected {
-                code: PatchRejectCode::StaleBase,
-                report: ocs_plugin_api::ipc::protocol::PatchRejectReport {
-                    current_revision: Some(ocs_plugin_api::scene::SceneRevision(self.head)),
-                    failed_op: None,
-                },
-            })
-        }
-    }
 
     /// Read a cell straight out of the model's registry.
     fn model_cell(state: &DemoState, row_key: u64, column: u64) -> TableCell {

@@ -322,36 +322,8 @@ impl Flow {
         Flow(&FEATURES[0])
     }
     #[cfg(test)]
-    pub(crate) fn widgets() -> Self {
-        Flow(&FEATURES[1])
-    }
-    #[cfg(test)]
     pub(crate) fn stale() -> Self {
         Flow(&FEATURES[2])
-    }
-    #[cfg(test)]
-    pub(crate) fn deliver() -> Self {
-        Flow(&FEATURES[3])
-    }
-    #[cfg(test)]
-    pub(crate) fn drag() -> Self {
-        Flow(&FEATURES[4])
-    }
-    #[cfg(test)]
-    pub(crate) fn menu_list() -> Self {
-        Flow(&FEATURES[5])
-    }
-    #[cfg(test)]
-    pub(crate) fn tree_lazy() -> Self {
-        Flow(&FEATURES[6])
-    }
-    #[cfg(test)]
-    pub(crate) fn cell_edit() -> Self {
-        Flow(&FEATURES[7])
-    }
-    #[cfg(test)]
-    pub(crate) fn asset_theme() -> Self {
-        Flow(&FEATURES[8])
     }
     #[cfg(test)]
     pub(crate) fn owner() -> Self {

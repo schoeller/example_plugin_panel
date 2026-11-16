@@ -456,7 +456,7 @@ mod tests {
         // the settle's event batch only through a LIVE widget mount.
         assert!(run_drag_demo(&sender, &mut state));
         assert!(crate::widgets_table::publish_widget_base(&sender, &mut state));
-        let armed_head = host.scene_head().expect("scene published").0;
+        let _armed_head = host.scene_head().expect("scene published").0;
         let card_rect = |elements: &[SceneElement]| {
             elements
                 .iter()

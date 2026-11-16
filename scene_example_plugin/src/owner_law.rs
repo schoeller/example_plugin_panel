@@ -63,13 +63,6 @@ mod tests {
     }
 
     impl OwnedByOtherHost {
-        fn new(head: u64) -> Self {
-            Self {
-                head,
-                served: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
         fn served(&self) -> Vec<&'static str> {
             self.served
                 .lock()
