@@ -175,13 +175,18 @@ pub struct DemoState {
     /// Authoritative settle moves not yet flushed (the `SCN_DEMO_DRAG`
     /// feature's run flushes them, one patch each).
     pub pending_moves: Vec<StableId>,
-    /// Validated GUI cell edits not yet acked (the `SCN_DEMO_CELLEDIT`
-    /// feature's run flushes them as ONE bounded cell patch).
+    /// Validated GUI cell edits not yet acked (flushed on the NEXT
+    /// OUTBOUND OPPORTUNITY — any flow frame / flush path carries them;
+    /// `SCN_DEMO_CELLEDIT` stays as the explicit force-flush).
     pub pending_cell_acks: Vec<crate::cell_edit::CellAck>,
     /// The bounded interaction journal (the SCN_DEBUG printout's legible
     /// loop record — what the host sent, what the plugin validated, what
     /// it answered). Oldest entries drop at [`JOURNAL_CAP`].
     pub journal: Vec<String>,
+    /// The ONE-LINE outcome the panel's status label carries (`scn_label_status`,
+    /// written through the ordinary bounded `UpdatePanel` path — no new wire
+    /// forms). `None` once narrated; the debug journal stays the FULL record.
+    pub status_line: Option<String>,
 }
 
 impl std::fmt::Debug for DemoState {
@@ -217,6 +222,7 @@ impl std::fmt::Debug for DemoState {
             .field("pending_moves", &self.pending_moves)
             .field("pending_cell_acks", &self.pending_cell_acks)
             .field("journal", &self.journal)
+            .field("status_line", &self.status_line)
             .finish()
     }
 }
@@ -228,6 +234,10 @@ impl DemoState {
     /// stay.
     pub(crate) fn begin_flow(&mut self) {
         self.last_frame = None;
+        // The status line is THIS run's outcome: a stale success line from
+        // an earlier exchange never narrates over a fresh refusal (the
+        // report line is the fallback).
+        self.status_line = None;
     }
 
     /// Record ONE frame's exchange outcome (the refusal print's material)
@@ -363,6 +373,14 @@ impl DemoState {
             self.journal.remove(0);
         }
         self.journal.push(line);
+    }
+
+    /// Record the ONE-LINE outcome the panel's status label carries (the
+    /// panel-narration write; [`Self::status_line`]). Diagnostic like the
+    /// journal — no flow branch reads it — and overwritten by the next
+    /// outcome.
+    pub(crate) fn note_status(&mut self, line: String) {
+        self.status_line = Some(line);
     }
 
     /// The MCP-parity address list: every showcased surface with the

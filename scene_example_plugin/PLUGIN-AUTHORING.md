@@ -108,9 +108,9 @@ ack leg; the semantic ones update your model:
 | `CommandInvoked` | a menu item / icon button / **drag settle** invoked its command | resolve what the command names for the reported target ids; the drag settle (`"drag_settle"`) names the dragged element's address — resolve its `DragMeta` from YOUR model (the wire never echoes the meta) and move the node authoritatively (`drag_demo.rs`) |
 | `ItemActivated` | a list item (or tree row) double-activated/committed | record the activation; act on your model (`menu_list.rs`) |
 | `TreeExpanded` | a branch expanded/collapsed | host-local presentation state — nothing to do UNLESS the branch was lazy (then the ask arrives as the demand/`ChildrenRequested`, see the next row) |
-| `ChildrenRequested` | a lazy branch needs rows | queue a bounded children page; answer by PUBLISHING the window (snapshot cycle) — never re-answer a satisfied window (`tree_lazy.rs`, `widgets_table.rs::deliver_pending`) |
+| `ChildrenRequested` | a lazy branch needs rows | queue a bounded children page; answer by PUBLISHING the window (snapshot cycle) — never re-answer a satisfied window, but DO re-answer after a fresh drawing (key the dedup on the host state you last saw, never a durable answered-once ledger) (`tree_lazy.rs`, `widgets_table.rs::deliver_pending`) |
 | `TablePageRequested` | a windowing table needs its next rows | queue the keyed window (`first_key` + `len`); answer by publishing the rows (`widgets_table.rs`) |
-| `TableCellChanged` | the user committed a cell edit IN THE HOST (two-phase pointer or keyboard) | validate against your model → apply → ack with ONE `WidgetOp::TableCell` patch; an invalid value is refused with the model untouched (`cell_edit.rs`) |
+| `TableCellChanged` | the user committed a cell edit IN THE HOST (two-phase pointer or keyboard) | validate against your model → apply → ack with ONE `WidgetOp::TableCell` patch on the NEXT OUTBOUND OPPORTUNITY (the ack queue auto-flushes — the committed value must stick, never wait for a command); an invalid value is refused with the model untouched (`cell_edit.rs`) |
 
 The rule underneath all rows: **events are notifications, patches are
 data**. Never answer an event by re-sending a whole collection — the

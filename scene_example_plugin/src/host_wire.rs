@@ -19,12 +19,12 @@ use ocs_plugin_api::ipc::protocol::{
 use ocs_plugin_api::scene::{PanelScene, PanelScenePatch, SceneRevision};
 use ocs_plugin_api::widgets::{WidgetEvent, WidgetSurface, WidgetSurfacePatch};
 
-// The read-side helpers the headless tests exercise directly (their kinds
-// and range types ride the same gate).
-#[cfg(test)]
+// The read-side helpers the flows and headless tests exercise directly
+// (their kinds and range types ride the same gate).
 use ocs_plugin_api::ipc::protocol::PanelStoreKind;
-#[cfg(test)]
+use ocs_plugin_api::scene::StableId;
 use ocs_plugin_api::widgets::WidgetRange;
+use ocs_plugin_api::dialog::DialogValue;
 
 /// Decoded answer of one v24 mutating frame (`PanelScenePublish` /
 /// `PanelScenePatch`): the typed ack, the structured rejection, a wire
@@ -154,14 +154,14 @@ pub fn send_widget_patch(
 }
 
 /// One windowed store read (`PanelStoreRead` → `StorePage`). The live demo
-/// derives its answers from events/demands; the headless tests exercise
-/// the read path directly against the wire double.
-#[cfg(test)]
+/// derives its answers from events/demands; the dedup reconciliation and
+/// the headless tests exercise the read path directly against the wire
+/// double.
 pub fn send_store_read(
     sender: &Arc<dyn PluginRequestSender>,
     panel_id: &str,
     kind: PanelStoreKind,
-    parent_id: Option<ocs_plugin_api::scene::StableId>,
+    parent_id: Option<StableId>,
     range: WidgetRange,
 ) -> Option<StoreWindow> {
     let response = sender.request(PluginRequest::PanelStoreRead {
@@ -176,6 +176,24 @@ pub fn send_store_read(
         }
         _ => None,
     }
+}
+
+/// The panel-narration write: ONE bounded `UpdatePanel` carrying the
+/// status label's one-line outcome — the wire's EXISTING update-panel
+/// form (v7), no new shapes. Best-effort by contract: a refusal keeps the
+/// console report as the outcome of record.
+pub fn send_update_panel(
+    sender: &Arc<dyn PluginRequestSender>,
+    panel_id: &str,
+    values: std::collections::HashMap<String, DialogValue>,
+) -> bool {
+    matches!(
+        sender.request(PluginRequest::UpdatePanel {
+            panel_id: panel_id.to_owned(),
+            values,
+        }),
+        Ok(PluginResponse::PanelUpdated(true))
+    )
 }
 
 /// The bounded recovery read (`PanelSceneSnapshot2` → `StorePage`): the

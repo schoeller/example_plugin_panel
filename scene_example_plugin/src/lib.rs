@@ -38,9 +38,14 @@
 //! - **Interaction roundtrip** ([`mod@state`]):
 //!   `HostNotification::PanelSceneEvents` batches merge into plugin state
 //!   and queue the merge ACKNOWLEDGMENT that rides the next publish's
-//!   event leg (patch frames carry no events field); `SCN_DELIVER` flushes
-//!   queued demand answers; `SCN_DEBUG` dumps the wire tallies and the
-//!   MCP-parity address list; `SCN_HELP` prints the feature table.
+//!   event leg (patch frames carry no events field); BOTH pending queues
+//!   (demand answers, validated cell-ack patches) flush on the NEXT
+//!   OUTBOUND OPPORTUNITY — any command run or absorbed notification
+//!   carries them, no dedicated command needed (`SCN_DELIVER` /
+//!   `SCN_DEMO_CELLEDIT` stay as the explicit force-flushes); every
+//!   feature's flow narrates its ONE-LINE outcome onto the panel's status
+//!   label; `SCN_DEBUG` dumps the wire tallies and the MCP-parity address
+//!   list; `SCN_HELP` prints the feature table.
 //! - **Drag demo** ([`mod@drag_demo`], `SCN_DEMO_DRAG`): a scene element
 //!   carrying [`DragMeta`](ocs_plugin_api::scene::DragMeta) — the host
 //!   runs Begin/host-local preview/Settle; the settle arrives as the
@@ -79,7 +84,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ocs_plugin_api::dialog::{DialogControl, HorizontalAlign, PanelDef};
+use ocs_plugin_api::dialog::{DialogControl, DialogValue, HorizontalAlign, PanelDef};
 use ocs_plugin_api::host::{BuiltinPlugin, HostApi, HostNotification, PluginRequestSender};
 use ocs_plugin_api::manifest::{ApiVersion, PluginManifest};
 use ocs_plugin_api::ribbon::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
@@ -219,8 +224,10 @@ static FEATURES: [DemoFeature; 10] = [
         id: "deliver",
         flow_name: "Deliver",
         commands: &[CMD_DELIVER],
-        observation: "queued demand answers (lazy children / table windows) flush as one \
-                      snapshot-cycle publish each; nothing new is built",
+        observation: "queued demand answers (lazy children / table windows) AND the \
+                      queued cell-ack patches flush as one bounded frame each — though \
+                      the auto-flush already carried them on the last outbound \
+                      opportunity; nothing new is built",
         ribbon: None,
         tail: FlowTail::Frame,
         run: deliver_only,
@@ -252,10 +259,11 @@ static FEATURES: [DemoFeature; 10] = [
         id: "tree_lazy",
         flow_name: "TreeLazy",
         commands: &[CMD_DEMO_TREE],
-        observation: "the tree gains the 'Sheets (lazy)' branch (no static children); \
-                      expanding it asks ChildrenRequested and every ask is answered with \
-                      the NEXT bounded 4-row page — satisfied windows are never \
-                      re-answered",
+        observation: "the tree grows TWO lazy branches; expanding either asks \
+                      ChildrenRequested and every ask is answered with the NEXT \
+                      bounded page — branch 12 its whole small set (rows 130..=132), \
+                      branch 13 in 4-row windows — and a fresh drawing re-answers \
+                      (the dedup keys on the host state, never an answered-once ledger)",
         ribbon: Some(("Showcase", "Lazy tree page", "\u{2503}", false)),
         tail: FlowTail::Frame,
         run: tree_lazy::run_tree_lazy_demo,
@@ -265,9 +273,10 @@ static FEATURES: [DemoFeature; 10] = [
         flow_name: "CellEdit",
         commands: &[CMD_DEMO_CELLEDIT],
         observation: "THE closed loop: a host-side cell edit (two-phase click or keyboard) \
-                      arrives as TableCellChanged, the plugin validates it against its \
-                      model, applies it and acks with ONE cell patch — a negative length \
-                      is refused with the model untouched",
+                       arrives as TableCellChanged, the plugin validates it against its \
+                       model and acks with ONE cell patch on the NEXT outbound \
+                       opportunity — no command needed, the value sticks; a negative \
+                       length is refused with the model untouched",
         ribbon: Some(("Showcase", "Cell edit loop", "\u{270E}", false)),
         tail: FlowTail::Frame,
         run: cell_edit::run_cell_edit_demo,
@@ -508,12 +517,16 @@ fn refused_report(state: &state::DemoState, flow: &Flow) -> String {
     format!("Scene Example: Flow::{} refused ({}){}", flow.name(), cause, flow_tail)
 }
 
-/// One demo command's shape: flush the queued demand answers first (the
-/// answers are publishes), then run the command's own flow (resolved from
-/// the [`FEATURES`] table), and report what the wire did — the applied arm
-/// keeps its tally awareness; the refused arm names the flow, the reject
-/// code, the report's head and the frame's base/claimed revision (or the
-/// exact codeless cause).
+/// One demo command's shape: flush BOTH pending queues first (the demand
+/// answers are publishes; the validated cell-ack patches are ONE bounded
+/// patch — the auto-flush law: every outbound opportunity carries them),
+/// then run the command's own flow (resolved from the [`FEATURES`] table),
+/// and report what the wire did — the applied arm keeps its tally
+/// awareness; the refused arm names the flow, the reject code, the
+/// report's head and the frame's base/claimed revision (or the exact
+/// codeless cause). The panel's status label then carries the ONE-LINE
+/// outcome (the feature's own when it recorded one, the report line
+/// otherwise).
 fn run_command(
     sender: &Option<Arc<dyn PluginRequestSender>>,
     state: &mut state::DemoState,
@@ -525,16 +538,26 @@ fn run_command(
     // The per-run frame record clears: a refusal print names THIS run's
     // exchange, never a previous one's.
     state.begin_flow();
+    // The pre-step: BOTH pending queues ride this outbound opportunity —
+    // the dedicated commands (`SCN_DELIVER` / `SCN_DEMO_CELLEDIT`) keep
+    // working as the explicit force-flushes on top.
+    let cell_acks_before = state.pending_cell_acks.len();
     let delivered = match state.widgets.is_some() {
         true => widgets_table::deliver_pending(sender, state),
         false => 0,
     };
+    if state.widgets.is_some() && cell_acks_before > 0 {
+        cell_edit::flush_cell_acks(sender, state);
+    }
+    let cell_acked = cell_acks_before.saturating_sub(state.pending_cell_acks.len());
     let applied = (flow.0.run)(sender, state);
-    let delivered_note = match delivered {
-        0 => String::new(),
-        n => format!("; {n} queued page deliver"),
+    let delivered_note = match (delivered, cell_acked) {
+        (0, 0) => String::new(),
+        (0, n) => format!("; {n} queued cell ack"),
+        (n, 0) => format!("; {n} queued page deliver"),
+        (n, m) => format!("; {n} queued page deliver + {m} queued cell ack"),
     };
-    match applied {
+    let report = match applied {
         true => format!(
             "Scene Example: flow applied{} (sent {}, applied {}, rejected {})",
             delivered_note, state.sent, state.applied, state.rejected
@@ -544,7 +567,29 @@ fn run_command(
             refused_report(state, &flow),
             delivered_note
         ),
-    }
+    };
+    narrate_status(sender, state, &report);
+    report
+}
+
+/// The panel-narration write: the status label (`scn_label_status`) gets
+/// the ONE-LINE outcome — the feature's own when its flow recorded one,
+/// the report line otherwise — through ONE bounded `UpdatePanel` on the
+/// wire's existing form. `SCN_DEBUG` keeps the FULL console journal.
+fn narrate_status(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut state::DemoState,
+    fallback: &str,
+) {
+    let line = state
+        .status_line
+        .take()
+        .unwrap_or_else(|| fallback.to_string());
+    host_wire::send_update_panel(
+        sender,
+        scene_graph::PANEL_ID,
+        std::iter::once(("scn_label_status".to_owned(), DialogValue::Text(line))).collect(),
+    );
 }
 
 /// The plugin entry point: the same lock-and-inner discipline as the root
@@ -570,6 +615,32 @@ impl SceneExamplePlugin {
     /// The sender the flows send through (cached at load).
     fn sender(&self) -> Option<Arc<dyn PluginRequestSender>> {
         self.state().sender.as_ref().map(|s| Arc::clone(s))
+    }
+
+    /// THE AUTO-FLUSH: pending cell-ack patches AND pending page delivers
+    /// flush on the NEXT OUTBOUND OPPORTUNITY — the notification the
+    /// plugin just absorbed IS that opportunity (the host talked to us;
+    /// the answers ride the ordinary bounded paths back, no dedicated
+    /// command needed). Every refusal law holds: a refused flush frame
+    /// restores its queue exactly (the acks front-first, the delivery back
+    /// at the queue head) and realigns the claim frontier — the SCN-050b
+    /// extension. A flushed outcome also narrates onto the status label.
+    fn auto_flush(&self) {
+        let Some(sender) = self.sender() else {
+            return;
+        };
+        let mut state = self.state();
+        // Both queues are widget-leg answers; without the live leg there
+        // is nothing to ride (and auto-flush never PUBLISHES a base — it
+        // only rides paths the plugin already sends).
+        if state.widgets.is_none() {
+            return;
+        }
+        widgets_table::deliver_pending(&sender, &mut state);
+        cell_edit::flush_cell_acks(&sender, &mut state);
+        if state.status_line.is_some() {
+            narrate_status(&sender, &mut state, "");
+        }
     }
 }
 
@@ -658,12 +729,16 @@ impl BuiltinPlugin for SceneExamplePlugin {
             } => {
                 if panel_id == scene_graph::PANEL_ID {
                     self.state().handle_events(surface_id, events);
+                    // THE flush law: the answers (the merged batch's ack
+                    // leg riding the next publish, the cell-ack patch, the
+                    // queued pages) go back on THIS outbound opportunity.
+                    self.auto_flush();
                 }
             }
             // The host's page-miss demands (lazy children / table windows):
-            // queue them; the answers are publishes on the next dispatch
-            // (demand and delivery stay decoupled, and rejections keep ONE
-            // mutation path).
+            // queue them; the answer publishes on the NEXT OUTBOUND
+            // OPPORTUNITY (the auto-flush below — demand and delivery stay
+            // decoupled, and rejections keep ONE mutation path).
             HostNotification::PanelStoreDemand {
                 panel_id,
                 surface_id,
@@ -671,14 +746,20 @@ impl BuiltinPlugin for SceneExamplePlugin {
                 range,
             } => {
                 if panel_id == scene_graph::PANEL_ID {
-                    let mut state = self.state();
-                    // The surface id names the surface the demand addresses:
-                    // it must be the one this plugin published (always, once
-                    // the widget leg is live).
-                    let known = state.widgets_surface_id();
-                    if known.is_none_or(|mine| mine == surface_id) {
-                        state.on_store_demand(parent_id, range);
+                    {
+                        let mut state = self.state();
+                        // The surface id names the surface the demand addresses:
+                        // it must be the one this plugin published (always, once
+                        // the widget leg is live).
+                        let known = state.widgets_surface_id();
+                        if known.is_none_or(|mine| mine == surface_id) {
+                            state.on_store_demand(parent_id, range);
+                        }
                     }
+                    // THE flush law: the demand's answer publishes on THIS
+                    // outbound opportunity — a user who expands a lazy
+                    // branch and does nothing else still sees the reveal.
+                    self.auto_flush();
                 }
             }
             // A future major's notifications decode through the `Unknown`
@@ -1143,5 +1224,108 @@ mod tests {
         ] {
             assert!(dump.contains(address), "the dump names {address}: {dump}");
         }
+    }
+
+    /// THE PANEL NARRATION + the pre-step flush: a command run flushes
+    /// BOTH pending queues on its outbound opportunity (the demand answers
+    /// AND the validated cell-ack patches — the report names both), and
+    /// the status label carries the ONE-LINE outcome through ONE bounded
+    /// `UpdatePanel` (no new wire forms; SCN_DEBUG keeps the full journal).
+    #[test]
+    fn run_command_flushes_both_queues_and_narrates_the_label() {
+        let host = std::sync::Arc::new(FakeWireHost::new());
+        let sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(scene_graph::run_scene_demo(&sender, &mut state));
+        assert!(widgets_table::run_widgets_demo(&sender, &mut state));
+        let surface_id = state.widgets_surface_id().expect("published");
+
+        // A committed GUI cell edit AND a table page demand queue up (the
+        // user did both since the last outbound opportunity).
+        state.handle_events(
+            surface_id,
+            vec![WidgetEvent::TableCellChanged {
+                surface_id,
+                row_key: StableId(303),
+                column_id: StableId(widgets_table::COL_LENGTH),
+                value: ocs_plugin_api::widgets::WidgetCellValue::Number(1.555),
+            }],
+        );
+        state.on_store_demand(
+            Some(StableId(widgets_table::TABLE_ID)),
+            WidgetRange { start: 8, len: 8 },
+        );
+
+        // Any feature command is an outbound opportunity for BOTH queues.
+        let report = run_command(&Some(Arc::clone(&sender)), &mut state, Flow::scene());
+        assert!(
+            report.contains("; 1 queued page deliver + 1 queued cell ack"),
+            "the report names both flushes: {report}"
+        );
+        // The store holds both answers: the committed value sticks and the
+        // window grew.
+        let def = &host.widgets().expect("published").tables[&StableId(widgets_table::TABLE_ID)];
+        assert_eq!(
+            def.rows.iter().find(|row| row.key.0 == 303).expect("row").cells[1],
+            ocs_plugin_api::widgets::TableCell::Number(1.555)
+        );
+        assert_eq!(def.rows.len(), 16);
+        // The status label carries the outcome (the LAST flush's line —
+        // the cell edit, written after the table window's own line).
+        assert_eq!(
+            host.last_status_label().as_deref(),
+            Some("cell edit acked (row 303 = 1.555)"),
+            "the label narrates through UpdatePanel: {:?}",
+            host.panel_updates()
+        );
+        // The narration rode the panel's own id on the existing form.
+        assert!(
+            host.panel_updates()
+                .iter()
+                .any(|(panel_id, values)| panel_id == scene_graph::PANEL_ID
+                    && values.contains_key("scn_label_status"))
+        );
+    }
+
+    /// The stale flow's recovery narrates the WHOLE story in one line (the
+    /// user's panel shows the loop, not just the console journal), and a
+    /// codeless refusal falls back to the report line (never a stale
+    /// success line over a refusal).
+    #[test]
+    fn flows_narrate_recovery_and_refusal_fallback() {
+        let host = std::sync::Arc::new(FakeWireHost::new());
+        let sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(scene_graph::run_scene_demo(&sender, &mut state));
+
+        let report = run_command(&Some(Arc::clone(&sender)), &mut state, Flow::stale());
+        assert!(report.contains("flow applied"), "{report}");
+        assert_eq!(
+            host.last_status_label().as_deref(),
+            Some("stale patch refused (head 4) → snapshot2 recovered → re-patch \
+                  applied (rev 5)"),
+            "the recovery's one-line story: {:?}",
+            host.panel_updates()
+        );
+
+        // The fallback: a refusal with no feature line narrates the report
+        // itself — never a stale success line over a refusal (begin_flow
+        // cleared the previous line). A fresh store: the wedged claim
+        // frontier refuses the scene flow's first patch.
+        let fresh_host = std::sync::Arc::new(FakeWireHost::new());
+        let fresh_sender: std::sync::Arc<dyn PluginRequestSender> =
+            std::sync::Arc::clone(&fresh_host) as std::sync::Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(scene_graph::run_scene_demo(&fresh_sender, &mut state));
+        state.head = 2; // THE WEDGE: the scene flow's patch refuses.
+        let report = run_command(&Some(fresh_sender), &mut state, Flow::scene());
+        assert!(report.contains("Flow::Scene refused"), "{report}");
+        assert_eq!(
+            fresh_host.last_status_label().as_deref(),
+            Some(report.as_str()),
+            "the refusal narrates its own report line"
+        );
     }
 }

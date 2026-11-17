@@ -226,6 +226,13 @@ pub fn run_stale_conflict(sender: &Arc<dyn PluginRequestSender>, state: &mut Dem
                 Some(claimed),
                 FrameOutcome::Applied,
             );
+            // The panel's own one-line story of the whole loop.
+            state.note_status(format!(
+                "stale patch refused (head {}) → snapshot2 recovered → re-patch \
+                 applied (rev {})",
+                reported_head.map(|head| head.0).unwrap_or(0),
+                claimed
+            ));
             true
         }
         WireOutcome::Rejected { code, report } => {
