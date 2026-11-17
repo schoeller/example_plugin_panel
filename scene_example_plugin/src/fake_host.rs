@@ -27,8 +27,10 @@
 //! from page misses; the demo tests inject those notifications directly),
 //! and non-v24 requests answer `Ok`.
 
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+use ocs_plugin_api::dialog::DialogValue;
 use ocs_plugin_api::host::{PluginRequestError, PluginRequestSender};
 use ocs_plugin_api::ipc::protocol::{
     PanelStoreKind, PatchRejectCode, PatchRejectReport, PluginRequest, PluginResponse,
@@ -57,6 +59,9 @@ pub struct FakeWireHost {
     /// Request labels served, in arrival order (the wire facts the tests
     /// name).
     served: Mutex<Vec<&'static str>>,
+    /// The `UpdatePanel` writes the plugin sent: `(panel_id, values)` in
+    /// arrival order (the panel-narration assertions read these).
+    panel_updates: Mutex<Vec<(String, HashMap<String, DialogValue>)>>,
 }
 
 impl Default for FakeWireHost {
@@ -70,6 +75,7 @@ impl FakeWireHost {
         Self {
             store: Mutex::new(Store::default()),
             served: Mutex::new(Vec::new()),
+            panel_updates: Mutex::new(Vec::new()),
         }
     }
 
@@ -148,6 +154,29 @@ impl FakeWireHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// The `UpdatePanel` writes the plugin sent (arrival order; the
+    /// panel-narration assertions read these).
+    pub fn panel_updates(&self) -> Vec<(String, HashMap<String, DialogValue>)> {
+        self.panel_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The LAST status-label text written through `UpdatePanel`
+    /// (`scn_label_status`; `None` before the first write).
+    pub fn last_status_label(&self) -> Option<String> {
+        self.panel_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find_map(|(_, values)| match values.get("scn_label_status") {
+                Some(DialogValue::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
     }
 
     // -- the v24 serving (the store's semantics, mirrored) ----------------
@@ -551,6 +580,16 @@ impl PluginRequestSender for FakeWireHost {
             PluginRequest::PanelSceneSnapshot2 { panel_id: _ } => {
                 self.record("PanelSceneSnapshot2");
                 self.snapshot2()
+            }
+            // The v7 update-panel write (the panel-narration leg): recorded
+            // verbatim, acknowledged like the host's own answer.
+            PluginRequest::UpdatePanel { panel_id, values } => {
+                self.record("UpdatePanel");
+                self.panel_updates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((panel_id, values));
+                PluginResponse::PanelUpdated(true)
             }
             // The headless tests exercise the v24 tails; everything else is
             // not this demo's contract.

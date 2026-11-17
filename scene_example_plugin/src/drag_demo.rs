@@ -247,6 +247,10 @@ fn flush_one_move(
                  revision {})",
                 address.0, claimed
             ));
+            state.note_status(format!(
+                "settle applied — node {} moved (one patch at revision {})",
+                address.0, claimed
+            ));
             MoveResult::Applied
         }
         host_wire::WireOutcome::Rejected { code, report } => {

@@ -3,7 +3,9 @@
 //! pair `validate()` demands) patched onto the EXISTING demo tree. When
 //! the host expands it, the `ChildrenRequested` ask is answered with the
 //! NEXT BOUNDED PAGE — never the whole backing set, and never a
-//! re-answer for an already-satisfied window.
+//! re-answer for an already-satisfied window (while the host state the
+//! plugin last saw still holds the rows — the dedup reconciles after a
+//! fresh host drawing).
 //!
 //! The base surface's first lazy branch (row 12, children 130..=132) is
 //! small enough to answer in one page; THIS branch (row 13) carries TEN
@@ -12,6 +14,13 @@
 //! page width), appended parent-before-child into the model and published
 //! through the documented snapshot cycle ([`crate::widgets_table::
 //! deliver_pending`]).
+//!
+//! # The per-branch answer-strategy table
+//!
+//! EVERY lazy branch the model knows is answered — [`strategy_for`] maps
+//! each known branch row to its answer strategy (whole-set vs paged), so
+//! the demand path refuses only addresses the model genuinely does not
+//! know (and the refusal names the branch per the journal grammar).
 //!
 //! Id space (the surface-wide namespace): branch row **13**, its backing
 //! children **140..=149** (past the base surface's rows 1..=12 and the
@@ -70,50 +79,101 @@ pub fn paged_child(index: usize) -> TreeRowDef {
     }
 }
 
-/// The paged branch's answer to ONE asked window: the fresh (never yet
-/// published) backing rows inside `[range.start, range.start +
-/// range.len)` — bounded by the page width, clipped to the backing set,
-/// appended parent-before-child into the model's tree. A repeat ask for a
-/// satisfied window is an honest no-op (`false` — nothing to publish).
-pub(crate) fn append_windowed_children(
+/// The answer strategy one known lazy branch uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchStrategy {
+    /// The branch's whole small backing set in ONE bounded answer (the
+    /// base surface's branch 12 — three rows).
+    WholeSet,
+    /// The asked window, at most [`PAGED_PAGE_LEN`] fresh rows per answer
+    /// (branch 13's ten backing children actually page).
+    Paged,
+}
+
+/// The per-branch answer-strategy table: EVERY lazy branch the model
+/// knows. An unlisted branch is not answered — the caller journals the
+/// named refusal (the model never guesses children it does not own).
+pub(crate) fn strategy_for(parent: u64) -> Option<BranchStrategy> {
+    match parent {
+        crate::widgets_table::LAZY_BRANCH_ROW => Some(BranchStrategy::WholeSet),
+        PAGED_BRANCH_ROW => Some(BranchStrategy::Paged),
+        _ => None,
+    }
+}
+
+/// The outcome of ONE children ask against the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildrenAnswer {
+    /// Fresh rows were appended into the model (parent-before-child held)
+    /// — the caller publishes the window.
+    Delivered {
+        /// The first appended row's stable id.
+        first: u64,
+        /// The last appended row's stable id.
+        last: u64,
+    },
+    /// The model already holds the asked rows — an HONEST no-op ONLY while
+    /// the host's current surface still holds them; the caller reconciles
+    /// the dedup against the host state the plugin last saw.
+    ModelSatisfied,
+    /// The model names no lazy branch at this address — the caller
+    /// journals the named refusal and sends nothing.
+    UnknownBranch,
+}
+
+/// The strategy-table answer to ONE children ask: the fresh (never yet
+/// published) backing rows for the branch's strategy — whole-set or the
+/// asked window (bounded by the page width, clipped to the backing set) —
+/// appended parent-before-child into the model's tree.
+pub(crate) fn answer_branch_children(
     state: &mut DemoState,
     parent: StableId,
     range: WidgetRange,
-) -> bool {
-    if parent.0 != PAGED_BRANCH_ROW {
-        return false;
-    }
+) -> ChildrenAnswer {
+    let Some(strategy) = strategy_for(parent.0) else {
+        return ChildrenAnswer::UnknownBranch;
+    };
     let Some(surface) = state.widgets.as_mut() else {
-        return false;
+        return ChildrenAnswer::UnknownBranch;
     };
     let Some(tree) = widgets_table::find_tree_mut(surface) else {
-        return false;
+        return ChildrenAnswer::UnknownBranch;
     };
     // Parent-before-child: the branch row must already be published (the
     // host can only ask for children of a row it has seen).
-    if !tree.rows.iter().any(|row| row.id.0 == PAGED_BRANCH_ROW) {
-        return false;
+    if !tree.rows.iter().any(|row| row.id.0 == parent.0) {
+        return ChildrenAnswer::UnknownBranch;
     }
     let published: std::collections::HashSet<u64> =
         tree.rows.iter().map(|row| row.id.0).collect();
-    let start = range.start.min(PAGED_CHILDREN_COUNT);
-    let end = range
-        .start
-        .saturating_add(range.len)
-        .min(PAGED_CHILDREN_COUNT)
-        .max(start);
-    let fresh: Vec<TreeRowDef> = (start..end)
-        .map(paged_child)
-        .filter(|child| !published.contains(&child.id.0))
-        .take(PAGED_PAGE_LEN)
-        .collect();
+    // The branch's fresh backing rows under its strategy.
+    let fresh: Vec<TreeRowDef> = match strategy {
+        BranchStrategy::WholeSet => widgets_table::backing_tree_children(parent)
+            .into_iter()
+            .filter(|child| !published.contains(&child.id.0))
+            .collect(),
+        BranchStrategy::Paged => {
+            let start = range.start.min(PAGED_CHILDREN_COUNT);
+            let end = range
+                .start
+                .saturating_add(range.len)
+                .min(PAGED_CHILDREN_COUNT)
+                .max(start);
+            (start..end)
+                .map(paged_child)
+                .filter(|child| !published.contains(&child.id.0))
+                .take(PAGED_PAGE_LEN)
+                .collect()
+        }
+    };
     if fresh.is_empty() {
-        return false;
+        return ChildrenAnswer::ModelSatisfied;
     }
+    let first = fresh.first().map(|row| row.id.0).unwrap_or(0);
+    let last = fresh.last().map(|row| row.id.0).unwrap_or(0);
     tree.rows.extend(fresh);
-    true
+    ChildrenAnswer::Delivered { first, last }
 }
-
 /// The lazy-tree feature's flow: ensure the widget leg exists, then ONE
 /// `Update` patch adds the branch to the EXISTING tree (the whole payload
 /// swaps; the model's current rows — including already-delivered children
@@ -320,10 +380,13 @@ mod tests {
         assert_eq!(branch_row_count(&state), 6 + 2 * PAGED_PAGE_LEN, "rows 144..=147");
 
         // A REPEAT ask for a satisfied window: no fresh rows → no publish.
+        // (The dedup is keyed on the HOST state the plugin last saw, so the
+        // check costs ONE bounded PanelStoreRead — the no-duplicate-PUBLISH
+        // law is what the count pins: exactly one extra frame, the read.)
         let served = host.served().len();
         ask(&mut state, 0, 4);
         assert_eq!(crate::widgets_table::deliver_pending(&sender, &mut state), 0);
-        assert_eq!(host.served().len(), served, "no duplicate fetch");
+        assert_eq!(host.served().len(), served + 1, "no duplicate publish — the one extra frame is the dedup's host read");
         assert_eq!(branch_row_count(&state), 6 + 2 * PAGED_PAGE_LEN);
 
         // The last page: rows 148..=149.
@@ -404,5 +467,172 @@ mod tests {
             "the structured refusal named the widget leg's head"
         );
         assert_eq!(state.head, state.widgets_head().expect("leg").0, "realigned");
+    }
+
+    /// A helper: the count of rows under `parent` in the addressed HOST's
+    /// store (the bounded read the tests take directly).
+    fn host_children(sender: &Arc<dyn PluginRequestSender>, parent: u64) -> usize {
+        host_wire::send_store_read(
+            sender,
+            PANEL_ID,
+            PanelStoreKind::TreeChildren,
+            Some(StableId(parent)),
+            WidgetRange { start: 0, len: 32 },
+        )
+        .expect("a page answered")
+        .rows
+        .len()
+    }
+
+    /// Branch 12 ("Surfaces (lazy)") IS answered — its whole small backing
+    /// set (130..=132) in ONE bounded answer, rows in the model AND
+    /// published; a repeat ask on the SAME host state stays deduped; an
+    /// unknown branch refuses BY NAME (the journal grammar).
+    #[test]
+    fn branch_12_answered_whole_set_unknown_branch_refused_by_name() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(crate::widgets_table::publish_widget_base(&sender, &mut state));
+
+        // The ask for branch 12 rides the ordinary delivery path.
+        state.on_store_demand(
+            Some(StableId(crate::widgets_table::LAZY_BRANCH_ROW)),
+            WidgetRange { start: 0, len: 8 },
+        );
+        assert_eq!(crate::widgets_table::deliver_pending(&sender, &mut state), 1);
+        // The rows are in the model AND in the host's store.
+        assert!(crate::widgets_table::tree_holds_row(
+            &state,
+            crate::widgets_table::LAZY_CHILDREN_BASE
+        ));
+        assert_eq!(
+            host_children(&sender, crate::widgets_table::LAZY_BRANCH_ROW),
+            crate::widgets_table::LAZY_CHILDREN_COUNT
+        );
+        // The panel narrates the page.
+        assert_eq!(
+            state.status_line.as_deref(),
+            Some("lazy page 1 delivered (rows 130..=132)")
+        );
+
+        // A repeat ask on the SAME host state: answered-once — no publish
+        // (the dedup's host read is the one extra frame).
+        let served = host.served().len();
+        state.on_store_demand(
+            Some(StableId(crate::widgets_table::LAZY_BRANCH_ROW)),
+            WidgetRange { start: 0, len: 8 },
+        );
+        assert_eq!(crate::widgets_table::deliver_pending(&sender, &mut state), 0);
+        assert_eq!(host.served().len(), served + 1, "no duplicate publish");
+
+        // An UNKNOWN branch refuses BY NAME: nothing is sent at all (no
+        // read, no publish) and the journal names the address.
+        let served = host.served().len();
+        state.on_store_demand(Some(StableId(1)), WidgetRange { start: 0, len: 8 });
+        assert_eq!(crate::widgets_table::deliver_pending(&sender, &mut state), 0);
+        assert_eq!(host.served().len(), served, "a refusal sends nothing");
+        assert!(
+            state
+                .journal
+                .iter()
+                .any(|line| line.contains("no lazy branch at row 1")),
+            "the refusal names the branch: {:?}",
+            state.journal
+        );
+    }
+
+    /// THE DEDUP RECONCILIATION (the fresh-drawing law): the answered-
+    /// window dedup is keyed on the HOST state the plugin last saw, not on
+    /// a durable answered-once ledger. On a fresh host store (a new
+    /// drawing — the store emptied under the carried plugin state) the
+    /// repeat ask IS re-answered: the model's rows republish through the
+    /// ordinary snapshot cycle and the fresh host holds them. The true
+    /// dedup stays pinned: once the fresh host holds the rows, the same
+    /// ask answers nothing again.
+    #[test]
+    fn dedup_reconciles_after_a_fresh_host_drawing() {
+        // Host A: arm the paged branch, answer two windows.
+        let host_a = Arc::new(FakeWireHost::new());
+        let sender_a: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host_a) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(crate::widgets_table::publish_widget_base(&sender_a, &mut state));
+        assert!(run_tree_lazy_demo(&sender_a, &mut state));
+        let surface_id = state.widgets_surface_id().expect("published");
+        for start in [0usize, 4] {
+            state.handle_events(
+                surface_id,
+                vec![WidgetEvent::ChildrenRequested {
+                    surface_id,
+                    parent_id: StableId(PAGED_BRANCH_ROW),
+                    range: WidgetRange { start, len: 8 },
+                }],
+            );
+            assert_eq!(crate::widgets_table::deliver_pending(&sender_a, &mut state), 1);
+        }
+        assert_eq!(host_children(&sender_a, PAGED_BRANCH_ROW), 8);
+
+        // THE FRESH DRAWING: a brand-new host store; the plugin state
+        // (model, cadence, journal) is carried over verbatim.
+        let host_b = Arc::new(FakeWireHost::new());
+        let sender_b: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host_b) as Arc<dyn PluginRequestSender>;
+        assert_eq!(host_children(&sender_b, PAGED_BRANCH_ROW), 0);
+
+        // The repeat ask on the fresh host: RE-ANSWERED.
+        state.handle_events(
+            surface_id,
+            vec![WidgetEvent::ChildrenRequested {
+                surface_id,
+                parent_id: StableId(PAGED_BRANCH_ROW),
+                range: WidgetRange { start: 0, len: 4 },
+            }],
+        );
+        assert_eq!(
+            crate::widgets_table::deliver_pending(&sender_b, &mut state),
+            1,
+            "a fresh drawing re-answers the ask"
+        );
+        assert!(
+            state
+                .journal
+                .iter()
+                .any(|line| line.contains("dedup reconciled")),
+            "the reconciliation is legible: {:?}",
+            state.journal
+        );
+        // The fresh host holds the branch rows again (the snapshot cycle
+        // regained the registry), parent-before-child intact.
+        let page = host_wire::send_store_read(
+            &sender_b,
+            PANEL_ID,
+            PanelStoreKind::TreeChildren,
+            Some(StableId(PAGED_BRANCH_ROW)),
+            WidgetRange { start: 0, len: 32 },
+        )
+        .expect("a page answered");
+        assert_eq!(page.rows.len(), 8);
+        for row in &page.rows {
+            let ocs_plugin_api::ipc::protocol::StoreRow::Tree(tree_row) = row else {
+                panic!("tree children page");
+            };
+            assert_eq!(tree_row.parent, Some(StableId(PAGED_BRANCH_ROW)));
+        }
+
+        // THE TRUE DEDUP, pinned on the fresh host too: the same ask now
+        // answers nothing (the host state the plugin saw holds the rows).
+        let served = host_b.served().len();
+        state.handle_events(
+            surface_id,
+            vec![WidgetEvent::ChildrenRequested {
+                surface_id,
+                parent_id: StableId(PAGED_BRANCH_ROW),
+                range: WidgetRange { start: 0, len: 4 },
+            }],
+        );
+        assert_eq!(crate::widgets_table::deliver_pending(&sender_b, &mut state), 0);
+        assert_eq!(host_b.served().len(), served + 1, "one read, no publish");
     }
 }

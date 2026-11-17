@@ -21,9 +21,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ocs_plugin_api::host::PluginRequestSender;
+use ocs_plugin_api::ipc::protocol::PanelStoreKind;
 use ocs_plugin_api::scene::{SceneRevision, StableId};
 use ocs_plugin_api::widgets::{
-    Axis, BadgeTone, CellKind, ConfirmPolicy, DomainRef, IconActionDef, IconRef, PanelTableDef,
+    Axis, BadgeTone, CellKind, ConfirmPolicy, DomainRef, IconActionDef, IconRef, MAX_WIDGET_ROWS_INITIAL,
+    PanelTableDef,
     TableCell, TableColumnDef, TableRef, TableRowDef, TreeCapabilities, TreeRowDef,
     WidgetCellValue, WidgetError, WidgetGroup, WidgetNode, WidgetOp, WidgetRange, WidgetSurface,
     WidgetSurfacePatch, WidgetTreeDef,
@@ -467,26 +469,194 @@ pub fn publish_widget_cycle(sender: &Arc<dyn PluginRequestSender>, state: &mut D
 /// row rule), the table window grows from the held rows onward (stable
 /// keys: the held — possibly patched — cells stay exactly as they were).
 /// Returns how many publishes went out.
+///
+/// The rollback law extends to the QUEUE: a publish that refused restores
+/// its delivery at the FRONT of the pending queue (arrival order
+/// preserved) — the answer is owed again, and the next opportunity retries
+/// it from the realigned frontier. Each delivered window also writes the
+/// panel-narration status line (the console journal stays the full record).
 pub fn deliver_pending(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoState) -> usize {
     let deliveries = std::mem::take(&mut state.pending_deliveries);
     let mut delivered = 0usize;
+    let mut owed: Vec<crate::state::PendingDelivery> = Vec::new();
     for delivery in deliveries {
-        let progressed = match delivery {
+        // `(should publish, the narration line)` — the line lands ONLY on
+        // an applied publish (a refused frame narrates nothing).
+        let (progressed, line) = match &delivery {
             crate::state::PendingDelivery::TreeChildren { parent, range } => {
-                append_lazy_children(state, parent, range)
+                answer_tree_children(sender, state, *parent, *range)
             }
             crate::state::PendingDelivery::TablePage {
                 table,
                 first_key,
                 len,
-            } => extend_table_window(state, table, first_key, len),
+            } => match extend_table_window(state, *table, *first_key, *len) {
+                Some(last_key) => (
+                    true,
+                    Some(format!(
+                        "table window delivered (keys {}..={})",
+                        first_key.0, last_key.0
+                    )),
+                ),
+                None => reconcile_table_window(sender, state, *table, *first_key, *len),
+            },
         };
-        if progressed && publish_widget_cycle(sender, state) {
-            state.pages_delivered += 1;
-            delivered += 1;
+        if progressed {
+            if publish_widget_cycle(sender, state) {
+                state.pages_delivered += 1;
+                delivered += 1;
+                if let Some(line) = line {
+                    state.note_status(line);
+                }
+            } else {
+                // The publish refused: the answer is owed again —
+                // front-first so the arrival order survives. The model's
+                // already-appended rows self-heal on the retry (the
+                // reconciliation below republishes the held window).
+                owed.push(delivery);
+            }
         }
     }
+    if !owed.is_empty() {
+        let mut restored = owed;
+        restored.extend(std::mem::take(&mut state.pending_deliveries));
+        state.pending_deliveries = restored;
+    }
     delivered
+}
+
+/// The model already covers the asked table window: dedup ONLY while the
+/// host's surface holds it too. A host whose window is short (a FRESH
+/// DRAWING — the store emptied under a carried plugin state) gets the
+/// window re-answered, the model's rows republishing through the ordinary
+/// snapshot cycle. Returns `(should publish, the narration line)`.
+fn reconcile_table_window(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+    table: StableId,
+    first_key: StableId,
+    len: usize,
+) -> (bool, Option<String>) {
+    if table.0 != TABLE_ID {
+        return (false, None);
+    }
+    let Some(start_index) = backing_row_index(first_key) else {
+        return (false, None);
+    };
+    let end = (start_index + len).min(TABLE_TOTAL_ROWS as usize);
+    // ONE bounded read of the host's held window (the same page-miss probe
+    // the host itself runs) decides the dedup.
+    let host_holds = matches!(
+        host_wire::send_store_read(
+            sender,
+            PANEL_ID,
+            PanelStoreKind::TableRows,
+            Some(table),
+            WidgetRange {
+                start: 0,
+                len: MAX_WIDGET_ROWS_INITIAL,
+            },
+        ),
+        Some(window) if window.rows.len() >= end
+    );
+    if host_holds {
+        return (false, None);
+    }
+    state.journal_note(format!(
+        "dedup reconciled: the host's window lacks keys up to {} the model holds \
+         — re-answering (fresh drawing?)",
+        first_key.0 + end as u64 - 1
+    ));
+    (
+        true,
+        Some(format!(
+            "table window re-answered (the host's surface lacked keys to {})",
+            first_key.0 + end as u64 - 1
+        )),
+    )
+}
+
+/// The tree-children answer for ONE ask: the model append when fresh rows
+/// exist; on a model-satisfied ask the HOST decides the dedup — the
+/// reconciliation law. Returns `(should publish, the narration line)`.
+fn answer_tree_children(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+    parent: Option<StableId>,
+    range: WidgetRange,
+) -> (bool, Option<String>) {
+    let Some(parent) = parent else {
+        // Root rows: the demo tree's roots are fully published; nothing
+        // exists beyond them — an honest no-op.
+        return (false, None);
+    };
+    match crate::tree_lazy::answer_branch_children(state, parent, range) {
+        crate::tree_lazy::ChildrenAnswer::Delivered { first, last } => (
+            true,
+            Some(format!(
+                "lazy page {} delivered (rows {}..={})",
+                state.pages_delivered + 1,
+                first,
+                last
+            )),
+        ),
+        crate::tree_lazy::ChildrenAnswer::UnknownBranch => {
+            state.journal_note(format!(
+                "children demand refused: the model names no lazy branch at row {} \
+                 (asked window {}..={})",
+                parent.0,
+                range.start,
+                range.start + range.len
+            ));
+            (false, None)
+        }
+        crate::tree_lazy::ChildrenAnswer::ModelSatisfied => {
+            // THE DEDUP, keyed on the host state the plugin last saw — not
+            // on a durable answered-once ledger: while the host's current
+            // surface still holds the branch's rows the ask is genuinely
+            // answered-once (no re-send); a host that lacks them (a FRESH
+            // DRAWING — the store emptied under a carried plugin state)
+            // gets the window re-answered, the model's rows republishing
+            // through the ordinary snapshot cycle.
+            if host_holds_children(sender, parent) {
+                (false, None)
+            } else {
+                state.journal_note(format!(
+                    "dedup reconciled: the host's surface lacks branch {} rows the \
+                     model holds — re-answering (fresh drawing?)",
+                    parent.0
+                ));
+                (
+                    true,
+                    Some(format!(
+                        "lazy branch {} re-answered (the host's surface lacked its rows)",
+                        parent.0
+                    )),
+                )
+            }
+        }
+    }
+}
+
+/// Does the HOST's current surface hold any children under `parent`? ONE
+/// bounded store read (the wire's existing read form, one row) — the same
+/// page-miss probe the host itself runs. A read that answers nothing
+/// usable counts as NOT holding (the retry lands on the publish, whose
+/// own refusal laws restore the queue).
+fn host_holds_children(sender: &Arc<dyn PluginRequestSender>, parent: StableId) -> bool {
+    matches!(
+        host_wire::send_store_read(
+            sender,
+            PANEL_ID,
+            PanelStoreKind::TreeChildren,
+            Some(parent),
+            WidgetRange {
+                start: 0,
+                len: 1
+            },
+        ),
+        Some(window) if !window.rows.is_empty()
+    )
 }
 
 /// Append the backing children of one lazy branch into the model's tree
@@ -494,74 +664,44 @@ pub fn deliver_pending(sender: &Arc<dyn PluginRequestSender>, state: &mut DemoSt
 /// FIRST lazy branch (row 12) answers its whole small backing set; the
 /// PAGED branch (row 13, [`crate::tree_lazy`]) answers the ASKED WINDOW
 /// only — the next bounded page, never a re-answer for a satisfied one.
-fn append_lazy_children(state: &mut DemoState, parent: Option<StableId>, range: WidgetRange) -> bool {
-    let Some(parent) = parent else {
-        // Root rows: the demo tree's roots are fully published; nothing
-        // exists beyond them — an honest no-op.
-        return false;
-    };
-    if parent.0 == crate::tree_lazy::PAGED_BRANCH_ROW {
-        return crate::tree_lazy::append_windowed_children(state, parent, range);
-    }
-    let children = backing_tree_children(parent);
-    if children.is_empty() {
-        return false;
-    }
-    let Some(surface) = state.widgets.as_mut() else {
-        return false;
-    };
-    let Some(tree) = find_tree_mut(surface) else {
-        return false;
-    };
-    // One delivery per row set: an already-published child skips the work.
-    let published: std::collections::HashSet<StableId> =
-        tree.rows.iter().map(|row| row.id).collect();
-    let fresh: Vec<TreeRowDef> = children
-        .into_iter()
-        .filter(|child| !published.contains(&child.id))
-        .collect();
-    if fresh.is_empty() {
-        return false;
-    }
-    // Parent bindings: the branch row precedes its children in the row vec
-    // (the payload-validation rule — appending keeps that).
-    tree.rows.extend(fresh);
-    true
-}
-
 /// Grow the published typed-table window to cover `first_key .. first_key +
 /// len` (holding the keys the registry already published — including any
-/// cell-patched values — and appending the fresh backing range).
+/// cell-patched values — and appending the fresh backing range). Returns
+/// the LAST appended key (`None` = honest no-op — the window already
+/// covers the ask, or the address is not this demo's registry table).
 fn extend_table_window(
     state: &mut DemoState,
     table: StableId,
     first_key: StableId,
     len: usize,
-) -> bool {
+) -> Option<StableId> {
     if table.0 != TABLE_ID {
         // The demo owns exactly one registry table; other asks are honest
         // no-ops (the store itself answers them with the empty page).
-        return false;
+        return None;
     }
     let Some(start_index) = backing_row_index(first_key) else {
-        return false;
+        return None;
     };
     let end = (start_index + len).min(TABLE_TOTAL_ROWS as usize);
     let Some(surface) = state.widgets.as_mut() else {
-        return false;
+        return None;
     };
     let Some(def) = surface.tables.get_mut(&table) else {
-        return false;
+        return None;
     };
     if def.rows.len() >= end {
-        return false;
+        return None;
     }
     // Append the missing rows in key order; the held rows (and their
     // patched cells) stay byte-identical.
+    let mut last = first_key;
     while def.rows.len() < end {
-        def.rows.push(backing_table_row(def.rows.len()));
+        let row = backing_table_row(def.rows.len());
+        last = row.key;
+        def.rows.push(row);
     }
-    true
+    Some(last)
 }
 
 /// The snapshot leg of the widget demo (the publish that goes LIVE on the
@@ -732,7 +872,11 @@ mod tests {
         let sender: Arc<dyn PluginRequestSender> =
             Arc::clone(&host) as Arc<dyn PluginRequestSender>;
         let mut plugin = crate::SceneExamplePlugin::new();
-        plugin.state().sender = Some(Arc::clone(&sender));
+        // The request line is deliberately NOT cached on the plugin here:
+        // this test pins the merge + manual-cycle discipline (the queues
+        // hold until an outbound opportunity runs); the auto-flush itself
+        // is proven by its own tests (the flush rides a CACHED sender's
+        // next notification).
 
         // (1) Publish + one-cell patch apply.
         {
@@ -1043,16 +1187,83 @@ mod tests {
             Some((PatchRejectCode::NonMonotonicRevision, Some(SceneRevision(2))))
         );
         // (d) THE HEAL: the next demand's cycle publishes from the
-        // realigned frontier — one frame, applied, the store agrees.
+        // realigned frontier — the store agrees. The queue-restore law
+        // (SCN-034) also re-delivers the demand the refused pass owed: the
+        // heal answers BOTH windows (the restored one via the fresh-
+        // drawing reconciliation, the new one via the ordinary extension).
         state.on_store_demand(Some(StableId(TABLE_ID)), WidgetRange { start: 16, len: 8 });
-        assert_eq!(deliver_pending(&sender, &mut state), 1);
-        assert_eq!(state.head, 3);
+        assert_eq!(deliver_pending(&sender, &mut state), 2);
+        assert_eq!(state.head, 4);
         let stored = host.widgets().expect("published").clone();
-        assert_eq!(stored.revision, SceneRevision(3));
+        assert_eq!(stored.revision, SceneRevision(4));
         assert_eq!(
             stored.tables[&StableId(TABLE_ID)].rows.len(),
             24,
             "the window grew past the wedged lane"
+        );
+    }
+
+    /// The rollback law extends to the DELIVERY QUEUE: a refused flush
+    /// frame restores the delivery EXACTLY (front-first), and the retry
+    /// reconciles — the model's already-appended rows republish and the
+    /// host's window grows to match (the fresh-drawing reconciliation
+    /// doubles as the heal).
+    #[test]
+    fn refused_delivery_flush_restores_the_queue_and_the_retry_reconciles() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut state = DemoState::default();
+        assert!(super::run_widgets_demo(&sender, &mut state));
+
+        // One queued window demand; the flush wedged (the frontier rewound
+        // below the held leg — the lost-response shape).
+        state.on_store_demand(Some(StableId(TABLE_ID)), WidgetRange { start: 8, len: 8 });
+        state.head = 0;
+        assert_eq!(deliver_pending(&sender, &mut state), 0);
+        // (a) the delivery is owed again — the queue restored EXACTLY;
+        assert_eq!(
+            state.pending_deliveries,
+            vec![PendingDelivery::TablePage {
+                table: StableId(TABLE_ID),
+                first_key: StableId(308),
+                len: 8,
+            }]
+        );
+        // (b) the reject's report realigned the frontier;
+        assert_eq!(state.head, state.widgets_head().expect("leg").0);
+        // (c) THE HEAL: the retry's publish applies and the host's window
+        // grows (the model's already-appended rows reconcile into it).
+        assert_eq!(deliver_pending(&sender, &mut state), 1);
+        assert!(state.pending_deliveries.is_empty());
+        let stored = host.widgets().expect("published").clone();
+        assert_eq!(
+            stored.tables[&StableId(TABLE_ID)].rows.len(),
+            16,
+            "the host regained the window the model held"
+        );
+        // The model and the host agree again.
+        assert_eq!(
+            state.widgets.as_ref().expect("model").tables[&StableId(TABLE_ID)].rows.len(),
+            16
+        );
+        // The reconcile is legible in the journal.
+        assert!(
+            state
+                .journal
+                .iter()
+                .any(|line| line.contains("dedup reconciled")),
+            "{:?}",
+            state.journal
+        );
+        // The status line narrated the reconciled delivery.
+        assert!(
+            state
+                .status_line
+                .as_deref()
+                .is_some_and(|line| line.contains("table window re-answered")),
+            "{:?}",
+            state.status_line
         );
     }
 }

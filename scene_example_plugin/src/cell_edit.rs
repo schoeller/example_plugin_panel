@@ -141,8 +141,8 @@ pub(crate) fn note_cell_changed(
                 value,
             });
             state.journal_note(format!(
-                "cell edit accepted: {note} — ack patch queued (SCN_DEMO_CELLEDIT \
-                 flushes)"
+                "cell edit accepted: {note} — ack patch queued (the next outbound \
+                 opportunity flushes it)"
             ));
         }
         Err(reason) => {
@@ -154,11 +154,19 @@ pub(crate) fn note_cell_changed(
     }
 }
 
-/// The cell-edit feature's flow: ensure the widget leg exists, then flush
-/// the queued acks as ONE bounded cell patch (the op count stays under
-/// the crate's patch budget; the surplus stays queued for the next run).
-/// Every refusal law applies: the model is mirrored ONLY on an applied
-/// frame; a rejected frame restores the acks and realigns the frontier.
+/// A queued cell value as the status label quotes it (one short token).
+fn value_note(value: &WidgetCellValue) -> String {
+    match value {
+        WidgetCellValue::Number(number) => format!("{number}"),
+        WidgetCellValue::Text(text) => format!("{text:?}"),
+        WidgetCellValue::Bool(flag) => format!("{flag}"),
+    }
+}
+
+/// The cell-edit feature's flow: ensure the widget leg exists, then the
+/// SAME bounded flush the auto-flush rides (the explicit command stays as
+/// the force-flush — with nothing queued it sends no frame, exactly as
+/// before).
 pub fn run_cell_edit_demo(
     sender: &Arc<dyn PluginRequestSender>,
     state: &mut DemoState,
@@ -168,6 +176,22 @@ pub fn run_cell_edit_demo(
     if state.widgets.is_none() && !widgets_table::publish_widget_base(sender, state) {
         return false;
     }
+    flush_cell_acks(sender, state)
+}
+
+/// THE AUTO-FLUSH half of the loop: drain the queued acks as ONE bounded
+/// cell patch (the op count stays under the crate's patch budget; the
+/// surplus stays queued for the next opportunity). This is the flush EVERY
+/// outbound opportunity rides (the notification-prestep in
+/// `run_command`, the live `auto_flush` after an event batch); the
+/// explicit `SCN_DEMO_CELLEDIT` command calls the very same path. Every
+/// refusal law applies: the model is mirrored ONLY on an applied frame; a
+/// rejected frame restores the acks (front-first, arrival order preserved)
+/// and realigns the claim frontier.
+pub(crate) fn flush_cell_acks(
+    sender: &Arc<dyn PluginRequestSender>,
+    state: &mut DemoState,
+) -> bool {
     if state.pending_cell_acks.is_empty() {
         return true;
     }
@@ -225,6 +249,22 @@ pub fn run_cell_edit_demo(
                  ONE cell patch acked {} op(s) at revision {}",
                 ack_count, claimed
             ));
+            // The panel's own one-line story (the console journal above
+            // stays the full record).
+            state.note_status(match acks.as_slice() {
+                [single] => format!(
+                    "cell edit acked (row {} = {})",
+                    single.row_key.0,
+                    value_note(&single.value)
+                ),
+                many => format!(
+                    "{} cell edits acked (rows {}..={} at revision {})",
+                    many.len(),
+                    many.first().map(|ack| ack.row_key.0).unwrap_or(0),
+                    many.last().map(|ack| ack.row_key.0).unwrap_or(0),
+                    claimed
+                ),
+            });
             true
         }
         host_wire::WireOutcome::Rejected { code, report } => {
@@ -268,6 +308,7 @@ pub fn run_cell_edit_demo(
 
 #[cfg(test)]
 mod tests {
+    use ocs_plugin_api::host::BuiltinPlugin;
     use ocs_plugin_api::ipc::protocol::PatchRejectCode;
     use ocs_plugin_api::widgets::{TableCell, WidgetEvent};
 
@@ -531,5 +572,162 @@ mod tests {
         assert_eq!(def.rows[1].cells[0], TableCell::Text("renamed".to_string()));
         // Neighbouring cells stayed exactly as published.
         assert_eq!(def.rows[0].cells[0], TableCell::Text("material 000".to_string()));
+    }
+
+    /// THE AUTO-FLUSH (the live symptom's fix): a host GUI commit accepted
+    /// by `on_notification` acks on THE SAME outbound opportunity — no
+    /// dedicated command runs — so the committed value STICKS in the
+    /// host's store (it can no longer visibly revert on re-render), and
+    /// the status label carries the one-line outcome.
+    #[test]
+    fn cell_edit_ack_flushes_on_the_next_outbound_opportunity() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut plugin = crate::SceneExamplePlugin::new();
+        plugin.state().sender = Some(Arc::clone(&sender));
+        {
+            let mut state = plugin.state();
+            assert!(widgets_table::publish_widget_base(&sender, &mut state));
+        }
+        let served = host.served().len();
+
+        // The host's GUI commit arrives as an ordinary event batch — the
+        // user does NOTHING else afterwards.
+        let surface_id = plugin
+            .state()
+            .widgets_surface_id()
+            .expect("published surface");
+        plugin.on_notification(
+            None,
+            ocs_plugin_api::host::HostNotification::PanelSceneEvents {
+                panel_id: crate::scene_graph::PANEL_ID.to_owned(),
+                surface_id,
+                events: vec![WidgetEvent::TableCellChanged {
+                    surface_id,
+                    row_key: StableId(306),
+                    column_id: StableId(COL_LENGTH),
+                    value: WidgetCellValue::Number(1.555),
+                }],
+            },
+        );
+
+        // The ack already flushed: the queue is empty and the host's store
+        // KEEPS the committed value (no revert on the next render).
+        {
+            let state = plugin.state();
+            assert!(
+                state.pending_cell_acks.is_empty(),
+                "the ack rode the notification's outbound opportunity"
+            );
+            assert_eq!(state.cell_edits_accepted, 1);
+            assert_eq!(state.cell_patch_frames, 1);
+            assert_eq!(
+                model_cell(&state, 306, COL_LENGTH),
+                TableCell::Number(1.555),
+                "the model adopted the edit"
+            );
+        }
+        let def = &host.widgets().expect("published").tables[&StableId(TABLE_ID)];
+        assert_eq!(
+            def.rows.iter().find(|row| row.key.0 == 306).expect("row").cells[1],
+            TableCell::Number(1.555),
+            "the store keeps the committed value"
+        );
+        // Exactly one outbound data frame was spent — the cell patch —
+        // plus the label narration's one bounded UpdatePanel (no publish,
+        // no extra command round-trip).
+        assert_eq!(
+            &host.served()[served..],
+            &["PanelScenePatch", "UpdatePanel"],
+            "the ack patch + the panel narration"
+        );
+        // The status label carries the one-line story.
+        assert_eq!(
+            host.last_status_label().as_deref(),
+            Some("cell edit acked (row 306 = 1.555)"),
+            "the panel narrates the outcome: {:?}",
+            host.panel_updates()
+        );
+    }
+
+    /// A REFUSED auto-flush frame restores the queue exactly (the SCN-050b
+    /// rollback law extended to the flush): the wedged claim frontier
+    /// refuses the ack patch, the ack is owed again, the model is
+    /// untouched — and the retry from the realigned frontier applies.
+    #[test]
+    fn refused_auto_flush_restores_the_queue_exactly() {
+        let host = Arc::new(FakeWireHost::new());
+        let sender: Arc<dyn PluginRequestSender> =
+            Arc::clone(&host) as Arc<dyn PluginRequestSender>;
+        let mut plugin = crate::SceneExamplePlugin::new();
+        plugin.state().sender = Some(Arc::clone(&sender));
+        {
+            let mut state = plugin.state();
+            assert!(widgets_table::publish_widget_base(&sender, &mut state));
+        }
+        let surface_id = plugin
+            .state()
+            .widgets_surface_id()
+            .expect("published surface");
+
+        // THE WEDGE: the frontier rewound below the held widget leg (the
+        // lost-response shape). The event still arrives...
+        plugin.state().head = 0;
+        plugin.on_notification(
+            None,
+            ocs_plugin_api::host::HostNotification::PanelSceneEvents {
+                panel_id: crate::scene_graph::PANEL_ID.to_owned(),
+                surface_id,
+                events: vec![WidgetEvent::TableCellChanged {
+                    surface_id,
+                    row_key: StableId(305),
+                    column_id: StableId(COL_LENGTH),
+                    value: WidgetCellValue::Number(7.25),
+                }],
+            },
+        );
+
+        // ...and the flush refused: the queue is restored EXACTLY (one
+        // ack, still owed), the model is untouched, the structured reject
+        // is recorded with its recovery fact, the frontier realigned.
+        {
+            let state = plugin.state();
+            assert_eq!(
+                state.pending_cell_acks.len(),
+                1,
+                "the ack is owed again, exactly as it was queued"
+            );
+            assert_eq!(state.cell_patch_frames, 0, "no frame applied");
+            assert_eq!(
+                model_cell(&state, 305, COL_LENGTH),
+                TableCell::Number(2.5),
+                "zero mutation on the model"
+            );
+            assert_eq!(
+                state.last_reject,
+                Some((
+                    ocs_plugin_api::ipc::protocol::PatchRejectCode::NonMonotonicRevision,
+                    state.widgets_head()
+                )),
+                "the structured refusal names the recovery fact"
+            );
+            assert_eq!(
+                state.head,
+                state.widgets_head().expect("leg").0,
+                "the claim frontier realigned to the report's head"
+            );
+        }
+        // THE HEAL: the retry (the same flush on the next opportunity)
+        // applies cleanly.
+        {
+            let mut state = plugin.state();
+            assert!(crate::cell_edit::flush_cell_acks(&sender, &mut state));
+        }
+        let def = &host.widgets().expect("published").tables[&StableId(TABLE_ID)];
+        assert_eq!(
+            def.rows.iter().find(|row| row.key.0 == 305).expect("row").cells[1],
+            TableCell::Number(7.25)
+        );
     }
 }
