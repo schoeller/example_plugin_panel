@@ -20,7 +20,7 @@ use std::sync::Arc;
 use ocs_plugin_api::host::PluginRequestSender;
 use ocs_plugin_api::scene::{
     MarkerKind, PanelScene, PanelScenePatch, Rect2D, SceneColor, SceneElement, SceneError,
-    SceneRevision, StableId, ThemeColor, Vec2,
+    SceneRevision, StableId, Stroke, ThemeColor, Vec2,
 };
 use ocs_plugin_api::scene_builder::{PatchBuilder, SceneBuilder};
 
@@ -40,6 +40,51 @@ pub const RECOVERED_LABEL: &str = "Node B (re-synchronized)";
 const CARD_SIZE: [f64; 2] = [160.0, 64.0];
 const TEXT_SIZE: f32 = 14.0;
 
+/// The themed 1-unit outline cards and edges stroke with — the same choice
+/// `drag_demo.rs`'s `normal_stroke()` makes (Normal theme, width 1.0).
+fn normal_stroke() -> Stroke {
+    Stroke {
+        color: SceneColor::Theme(ThemeColor::Normal),
+        width: 1.0,
+    }
+}
+
+/// A node card's rect: Strong theme fill (the primary strong token — the
+/// demo's cards read unmistakably against the host background) plus a
+/// 1-unit Normal stroke. Built as a literal and inserted through
+/// [`SceneBuilder::element`], because the fluent `rect()` defaults
+/// `fill: None, stroke: None` — legally invisible on the host.
+fn card_rect(id: u64, origin: [f64; 2]) -> SceneElement {
+    SceneElement::Rect {
+        id: StableId(id),
+        name: None,
+        actions: Vec::new(),
+        drag: None,
+        pos: Vec2(origin),
+        size: Vec2(CARD_SIZE),
+        fill: Some(SceneColor::Theme(ThemeColor::Strong)),
+        stroke: Some(normal_stroke()),
+    }
+}
+
+/// A demo edge with a visible Normal 1-unit stroke (mirroring
+/// `drag_demo.rs`'s `normal_stroke()`); the fluent `edge()` defaults
+/// `stroke: None`, so edges route through [`SceneBuilder::element`] too.
+fn stroked_edge(id: u64, a: u64, b: u64, route: Vec<Vec2>) -> SceneElement {
+    SceneElement::Edge {
+        id: StableId(id),
+        name: None,
+        actions: Vec::new(),
+        drag: None,
+        a: StableId(a),
+        b: StableId(b),
+        route,
+        stroke: Some(normal_stroke()),
+        start_marker: None,
+        end_marker: None,
+    }
+}
+
 /// One node card in the currently open container of `scene`: an inner
 /// group (card rect + one port per side + one text label) with a display
 /// name. The chained builder carries the caller's lifetime — the fluent
@@ -58,7 +103,7 @@ fn add_node_card<'a>(
     scene
         .group(base)?
         .name(Some(label))
-        .rect(base + 1, origin, CARD_SIZE)?
+        .element(card_rect(base + 1, origin))
         .port(base + 2, card_mid_right)?
         .port(base + 3, card_mid_left)?
         .text(
@@ -135,10 +180,15 @@ pub fn demo_graph_scene(revision: u64) -> Result<PanelScene, SceneError> {
     add_node_card(&mut scene, 2, [320.0, 240.0], "Node C")?;
     scene.element(legend_group());
     scene
-        .edge(70, 12, 23, vec![Vec2([200.0, 72.0]), Vec2([320.0, 72.0])])?
+        .element(stroked_edge(
+            70,
+            12,
+            23,
+            vec![Vec2([200.0, 72.0]), Vec2([320.0, 72.0])],
+        ))
         .name(Some("A to B"));
     scene
-        .edge(
+        .element(stroked_edge(
             71,
             22,
             33,
@@ -147,7 +197,7 @@ pub fn demo_graph_scene(revision: u64) -> Result<PanelScene, SceneError> {
                 Vec2([480.0, 272.0]),
                 Vec2([320.0, 272.0]),
             ],
-        )?
+        ))
         .name(Some("B to C"));
     scene
         .marker(
@@ -168,7 +218,15 @@ fn node_d() -> Result<SceneElement, SceneError> {
 /// Edge C→D (the second `Add` op of patch 1): routes node C's east port
 /// (id 32) to node D's west port (id 43) as a straight two-point route.
 fn edge_c_to_d() -> Result<SceneElement, SceneError> {
-    built_element(|scene| scene.edge(72, 32, 43, vec![Vec2([480.0, 272.0]), Vec2([560.0, 272.0])]))
+    built_element(|scene| {
+        scene.element(stroked_edge(
+            72,
+            32,
+            43,
+            vec![Vec2([480.0, 272.0]), Vec2([560.0, 272.0])],
+        ));
+        Ok(scene)
+    })
 }
 
 /// B's label as a full replacement element (the `Replace` op of patch 2 is
@@ -500,6 +558,54 @@ mod tests {
         };
         assert_eq!(ops, MAX_PATCH_OPS + 1);
         assert_eq!(max, MAX_PATCH_OPS);
+    }
+
+    #[test]
+    fn graph_cards_and_edges_carry_visible_paint() {
+        // The host paints NOTHING for fill-less, stroke-less rects/paths:
+        // every card rect and edge in the demo scene must carry visible
+        // theme paint (Strong fill + 1-unit Normal stroke on the cards,
+        // Normal stroke on the edges).
+        fn assert_paint(element: &SceneElement, cards: &mut usize, edges: &mut usize) {
+            match element {
+                SceneElement::Group { children, .. } => {
+                    for child in children {
+                        assert_paint(child, cards, edges);
+                    }
+                }
+                SceneElement::Rect { fill, stroke, .. } => {
+                    *cards += 1;
+                    assert_eq!(*fill, Some(SceneColor::Theme(ThemeColor::Strong)));
+                    assert_eq!(
+                        stroke.map(|s| (s.color, s.width)),
+                        Some((SceneColor::Theme(ThemeColor::Normal), 1.0))
+                    );
+                }
+                SceneElement::Edge { stroke, .. } => {
+                    *edges += 1;
+                    assert_eq!(
+                        stroke.map(|s| (s.color, s.width)),
+                        Some((SceneColor::Theme(ThemeColor::Normal), 1.0))
+                    );
+                }
+                _ => {}
+            }
+        }
+        let mut cards = 0;
+        let mut edges = 0;
+        for element in &demo_graph_scene(1).unwrap().elements {
+            assert_paint(element, &mut cards, &mut edges);
+        }
+        assert_eq!(cards, 3, "nodes A/B/C in the base scene");
+        assert_eq!(edges, 2, "A→B and B→C in the base scene");
+
+        // Patch 1's added pair carries the same paint.
+        let mut card = 0;
+        let mut edge = 0;
+        assert_paint(&node_d().unwrap(), &mut card, &mut edge);
+        assert_paint(&edge_c_to_d().unwrap(), &mut card, &mut edge);
+        assert_eq!(card, 1, "node D's card");
+        assert_eq!(edge, 1, "the C→D route");
     }
 
     #[test]
