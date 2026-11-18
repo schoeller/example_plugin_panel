@@ -21,7 +21,7 @@ repository = "schoeller/example_plugin_panel"
 # Keep in sync with the Rust manifest's `ApiVersion::CURRENT` — this is the
 # pre-load gate (API_VERSION_MIN_SUPPORTED=3 .. the host's API major, 24);
 # the runner also checks the compiled-in `ocs_plugin_api_version` symbol.
-api_version = 24
+api_version = 26
 rustc_version = "__RUSTC_VERSION__"
 acadrust_source = "__ACADRUST_SOURCE__"
 ribbon_order = 120
